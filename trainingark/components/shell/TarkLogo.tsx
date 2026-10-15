@@ -16,9 +16,9 @@ export function TarkLogo({ size = 'nav' }: TarkLogoProps) {
     <svg width={w} height={h} viewBox="0 0 300 130" xmlns="http://www.w3.org/2000/svg">
         <defs>
             <linearGradient id="tarkGold" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stop-color="#e8c96a" />
-                <stop offset="60%" stop-color="#c9a84c" />
-                <stop offset="100%" stop-color="#a07828" />
+                <stop offset="0%" stopColor="#e8c96a" />
+                <stop offset="60%" stopColor="#c9a84c" />
+                <stop offset="100%" stopColor="#a07828" />
             </linearGradient>
         </defs>
       <polygon points="38,118 58,30 74,30 54,118" fill="url(#tarkGold)" />
@@ -26,11 +26,11 @@ export function TarkLogo({ size = 'nav' }: TarkLogoProps) {
       <polygon points="224,28 258,28 224,54" fill="#a07828" />
       <text
           x="75" y="112"
-          font-family="'Trebuchet MS', sans-serif"
-          font-size="88"
-          font-weight="600"
+          fontFamily="'Trebuchet MS', sans-serif"
+          fontSize="88"
+          fontWeight="600"
           fill="#e8e0d4"
-          letter-spacing="8"
+          letterSpacing="8"
       >ARK</text>
     </svg>
   )
