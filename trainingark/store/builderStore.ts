@@ -83,7 +83,6 @@ interface BuilderState {
   toggleDoesNotUntap: (playerIndex: number, cardId: string) => void
   setTriggerTag: (playerIndex: number, cardId: string, triggerTag?: TriggerTag) => void
   drawCard: (playerIndex: number) => void
-  searchLibrary: (playerIndex: number) => void
   shuffleLibrary: (playerIndex: number) => void
   populateLibrary: (playerIndex: number, cards: Card[]) => void
   untapAll: (playerIndex: number) => void
@@ -350,6 +349,24 @@ function cardFromStackItem(item: StackItem): Card {
     imageUrl: item.imageUrl,
     cardType: item.cardType ?? 'instant',
   }
+}
+
+// A search happens while the searching object resolves, so opponent-searches
+// is offered here rather than at cast/activation — otherwise an accepted
+// Archivist of Oghma trigger would sit above the tutor and resolve first.
+// Callers only pass objects that perform the search themselves: instants,
+// sorceries, their storm copies, and abilities (fetch land activations,
+// "when this enters, search" triggers). A permanent spell resolving does not
+// search; its ETB trigger does, when that trigger resolves.
+function searchPromptOnResolve(
+  players: [Player, Player, Player, Player],
+  item: StackItem,
+  counters: TurnCounters
+): PendingTriggerPrompt | null {
+  if (!item.sourceCard?.searchesLibrary) return null
+  const controllerIndex = players.findIndex(p => p.name === item.controller)
+  if (controllerIndex === -1) return null
+  return triggerPromptForEvent(players, 'opponent-searches', controllerIndex, counters, item.sourceCard)
 }
 
 function placeCardInZone(
@@ -1101,7 +1118,8 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
     // Counters, storm, and reactive trigger prompts only apply to a real
     // cast, and only during play — setup is board construction, not an
-    // in-game event, so nothing should fire or increment there.
+    // in-game event, so nothing should fire or increment there. Library
+    // searches are offered later, by resolveStack.
     if (type !== 'cast' || !state.scenarioStarted) {
       set({ players: updated, stack: newStack, logLines: newLogLines })
       return
@@ -1166,16 +1184,21 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
     if (item.isStormCopy) {
       // A copy ceases to exist on resolution rather than landing in a zone.
+      // A copied tutor still searches as it resolves.
+      const prompt = state.scenarioStarted ? searchPromptOnResolve(state.players, item, state.turnCounters) : null
       set({
         stack: state.stack.filter(s => s.id !== itemId),
+        pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
         logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s storm copy ceases to exist.`] : state.logLines,
       })
       return
     }
 
     if (isAbility(item.type)) {
+      const prompt = state.scenarioStarted ? searchPromptOnResolve(state.players, item, state.turnCounters) : null
       set({
         stack: state.stack.filter(s => s.id !== itemId),
+        pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
         logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s ability resolves.`] : state.logLines,
       })
       return
@@ -1189,9 +1212,11 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       : `${item.sourceCardName} resolves and is put into the graveyard.`
 
     const controllerIndex = updated.findIndex(p => p.name === item.controller)
-    const prompt = (isPermanent && state.scenarioStarted && controllerIndex !== -1)
-      ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters)
-      : null
+    const prompt = !state.scenarioStarted
+      ? null
+      : isPermanent
+        ? (controllerIndex !== -1 ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters) : null)
+        : searchPromptOnResolve(updated, item, state.turnCounters)
 
     set({
       players: updated,
@@ -1352,20 +1377,6 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       turnCounters: newCounters,
       pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
       logLines: [...state.logLines, `${player.name} draws a card.`],
-    })
-  },
-
-  searchLibrary: (playerIndex) => {
-    const state = get()
-    if (!state.players) return
-    pushHistory(state)
-    const player = state.players[playerIndex]
-    const prompt = state.scenarioStarted
-      ? triggerPromptForEvent(state.players, 'opponent-searches', playerIndex, state.turnCounters)
-      : null
-    set({
-      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
-      logLines: state.scenarioStarted ? [...state.logLines, `${player.name} searches their library.`] : state.logLines,
     })
   },
 

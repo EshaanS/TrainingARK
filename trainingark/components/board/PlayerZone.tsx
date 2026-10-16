@@ -94,7 +94,7 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const {
     players, updatePlayer, confirmSetup, setupComplete,
     moveCard, moveAllCards, addCard, castToStack, setLife, setTax, setTaxPartner,
-    decklists, drawCard, searchLibrary, shuffleLibrary, removeCard, createTokenCopy,
+    decklists, drawCard, shuffleLibrary, removeCard, createTokenCopy,
     incrementToken, decrementToken, toggleTapped, toggleRevealed,
     toggleDoesNotUntap, setTriggerTag,
     handSizes, setHandSize,
@@ -530,7 +530,6 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
         { label: 'Move all to Graveyard', action: () => moveAllFromZone('library', 'graveyard') },
         { label: 'Move all to Exile', action: () => moveAllFromZone('library', 'exile') },
         { label: 'Shuffle', action: () => shuffleLibrary(playerIndex) },
-        { label: 'Declare Library Search', action: () => searchLibrary(playerIndex) },
       ], libraryAddBtnRef, () => { const r = libraryAddBtnRef.current?.getBoundingClientRect(); if (r) handleAddCard('library', r) })}
       {fetchingCards && !viewMode ? (
         <div className={styles.emptyPile} style={{ width: 'var(--card-w)', height: 'var(--card-h)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>

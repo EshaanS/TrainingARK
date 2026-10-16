@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { detectTriggerTag, detectStormGrant, detectCardMetadata } from './triggerDetection'
+import { detectTriggerTag, detectStormGrant, detectCardMetadata, detectSearchesLibrary } from './triggerDetection'
 
 // Oracle text below is verbatim from Scryfall (fetched while writing these
 // tests), not paraphrased, since the parser is sensitive to exact phrasing.
@@ -58,6 +58,60 @@ describe('detectTriggerTag — one case per event, using real oracle text', () =
   it('Blood Artist -> creature-dies', () => {
     expect(detectTriggerTag('Whenever this creature or another creature dies, target player loses 1 life and you gain 1 life.'))
       .toEqual({ event: 'creature-dies' })
+  })
+})
+
+describe('detectTriggerTag — ordinal draw triggers ("second card each turn")', () => {
+  it('Faerie Mastermind -> opponent-draws with ordinal 2', () => {
+    const text = 'Flash\nFlying\nWhenever an opponent draws their second card each turn, you draw a card.\n{3}{U}: Each player draws a card.'
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', spellNumber: 2 })
+  })
+
+  it('Gleaming Splendor -> opponent-draws with ordinal 2', () => {
+    const text = 'Whenever an opponent draws their second card each turn, you create a Treasure token.\n{2}{W}: Two target players each draw a card.'
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', spellNumber: 2 })
+  })
+})
+
+describe('detectSearchesLibrary — cards that search their controller\'s library', () => {
+  // Verbatim Scryfall oracle text, fetched live.
+  const searchers: [string, string][] = [
+    ['Demonic Tutor', 'Search your library for a card, put that card into your hand, then shuffle.'],
+    ['Vampiric Tutor', 'Search your library for a card, then shuffle and put that card on top. You lose 2 life.'],
+    ['Enlightened Tutor', 'Search your library for an artifact or enchantment card, reveal it, then shuffle and put that card on top.'],
+    ['Mystical Tutor', 'Search your library for an instant or sorcery card, reveal it, then shuffle and put that card on top.'],
+    ['Worldly Tutor', 'Search your library for a creature card, reveal it, then shuffle and put the card on top.'],
+    ['Crop Rotation', 'As an additional cost to cast this spell, sacrifice a land.\nSearch your library for a land card, put that card onto the battlefield, then shuffle.'],
+    ["Green Sun's Zenith", "Search your library for a green creature card with mana value X or less, put it onto the battlefield, then shuffle. Shuffle Green Sun's Zenith into its owner's library."],
+    ['Chord of Calling', "Convoke (Your creatures can help cast this spell. Each creature you tap while casting this spell pays for {1} or one mana of that creature's color.)\nSearch your library for a creature card with mana value X or less, put it onto the battlefield, then shuffle."],
+    ['Finale of Devastation', 'Search your library and/or graveyard for a creature card with mana value X or less and put it onto the battlefield. If you search your library this way, shuffle. If X is 10 or more, creatures you control get +X/+X and gain haste until end of turn.'],
+    ['Scalding Tarn', '{T}, Pay 1 life, Sacrifice this land: Search your library for an Island or Mountain card, put it onto the battlefield, then shuffle.'],
+    ['Polluted Delta', '{T}, Pay 1 life, Sacrifice this land: Search your library for an Island or Swamp card, put it onto the battlefield, then shuffle.'],
+    ['Misty Rainforest', '{T}, Pay 1 life, Sacrifice this land: Search your library for a Forest or Island card, put it onto the battlefield, then shuffle.'],
+    ['Flooded Strand', '{T}, Pay 1 life, Sacrifice this land: Search your library for a Plains or Island card, put it onto the battlefield, then shuffle.'],
+    ['Verdant Catacombs', '{T}, Pay 1 life, Sacrifice this land: Search your library for a Swamp or Forest card, put it onto the battlefield, then shuffle.'],
+  ]
+
+  it.each(searchers)('%s is flagged searchesLibrary', (_name, text) => {
+    expect(detectSearchesLibrary(text)).toBe(true)
+    expect(detectCardMetadata(text).searchesLibrary).toBe(true)
+  })
+
+  it('Boseiju, Who Endures is not flagged — the opponent ("that player") searches, not its controller', () => {
+    const text = '{T}: Add {G}.\nChannel — {1}{G}, Discard this card: Destroy target artifact, enchantment, or nonbasic land an opponent controls. That player may search their library for a land card with a basic land type, put it onto the battlefield, then shuffle. This ability costs {1} less to activate for each legendary creature you control.'
+    expect(detectSearchesLibrary(text)).toBe(false)
+    expect(detectCardMetadata(text, ['Channel'])).toEqual({})
+  })
+
+  it('Opposition Agent is not flagged — it punishes searching, it does not search', () => {
+    const text = "Flash\nYou control your opponents while they're searching their libraries.\nWhile an opponent is searching their library, they exile each card they find. You may play those cards for as long as they remain exiled, and you may spend mana as though it were mana of any color to cast them."
+    expect(detectSearchesLibrary(text)).toBe(false)
+    expect(detectCardMetadata(text, ['Flash'])).toEqual({})
+  })
+
+  it('Archivist of Oghma watches for searches but does not search, so it is tagged but not flagged', () => {
+    const metadata = detectCardMetadata('Flash\nWhenever an opponent searches their library, you gain 1 life and draw a card.', ['Flash'])
+    expect(metadata).toEqual({ triggerTag: { event: 'opponent-searches' } })
   })
 })
 

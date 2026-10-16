@@ -56,6 +56,15 @@ function spellOrdinal(oracleText: string): number | undefined {
   return undefined
 }
 
+// Faerie Mastermind and Gleaming Splendor: "draws their second card each
+// turn". Bowmasters' "except the first one they draw in each of their draw
+// steps" deliberately does not match — it is not a simple ordinal.
+function drawOrdinal(oracleText: string): number | undefined {
+  if (/\bdraws\s+their\s+first\s+card\s+each\s+turn/i.test(oracleText)) return 1
+  if (/\bdraws\s+their\s+second\s+card\s+each\s+turn/i.test(oracleText)) return 2
+  return undefined
+}
+
 export function detectTriggerTag(oracleText?: string): TriggerTag | undefined {
   if (!oracleText) return undefined
 
@@ -84,7 +93,8 @@ export function detectTriggerTag(oracleText?: string): TriggerTag | undefined {
   // though draw-for-turn is not modelled yet, so its draw-step exception is
   // left for the author to dismiss.
   if (hasUsableMatch(oracleText, /whenever an opponent draws/i)) {
-    return { event: 'opponent-draws' }
+    const ordinal = drawOrdinal(oracleText)
+    return ordinal === undefined ? { event: 'opponent-draws' } : { event: 'opponent-draws', spellNumber: ordinal }
   }
   if (hasUsableMatch(oracleText, /when(?:ever)?\s+[^.\n]{0,120}\benters(?:\s+the battlefield)?\b/i)) {
     return { event: 'permanent-etb-yours' }
@@ -119,17 +129,28 @@ export function detectStormGrant(oracleText?: string): Card['grantsStorm'] | und
   return { toTypes }
 }
 
+// Matches the card's own controller searching: tutors, Crop Rotation, Green
+// Sun's Zenith, Finale of Devastation ("search your library and/or
+// graveyard"), and fetch lands. Deliberately does not match Boseiju ("That
+// player may search their library" — an opponent searches, not you) or
+// Opposition Agent ("while they're searching their libraries" — static).
+export function detectSearchesLibrary(oracleText?: string): boolean {
+  return !!oracleText && /\bsearch your library\b/i.test(oracleText)
+}
+
 export function detectCardMetadata(
   oracleText?: string,
   keywords?: unknown
-): Pick<Card, 'triggerTag' | 'hasStorm' | 'grantsStorm'> {
+): Pick<Card, 'triggerTag' | 'hasStorm' | 'grantsStorm' | 'searchesLibrary'> {
   const hasStorm = Array.isArray(keywords)
     && keywords.some(keyword => typeof keyword === 'string' && keyword.toLowerCase() === 'storm')
   const triggerTag = detectTriggerTag(oracleText)
   const grantsStorm = detectStormGrant(oracleText)
+  const searchesLibrary = detectSearchesLibrary(oracleText)
   return {
     ...(triggerTag && { triggerTag }),
     ...(hasStorm && { hasStorm: true }),
     ...(grantsStorm && { grantsStorm }),
+    ...(searchesLibrary && { searchesLibrary: true }),
   }
 }

@@ -24,6 +24,8 @@ export interface TriggerTag {
   qualifier?: 'noncreature'
   // Some triggered abilities contain a simple ordinal condition. This is a
   // suggestion gate only: authors can always add the ability manually.
+  // Despite the name, for opponent-draws it is the nth card drawn this turn.
+  // Kept as-is because tags are persisted inside saved scenario snapshots.
   spellNumber?: number
   controllerScope?: 'opponents' | 'any-player'
 }
@@ -53,6 +55,9 @@ export interface Card {
   triggerTag?: TriggerTag
   hasStorm?: boolean
   grantsStorm?: { toTypes: CardType[] }
+  // Casting or activating this card searches its controller's library, which
+  // offers opponent-searches triggers (Archivist of Oghma).
+  searchesLibrary?: boolean
   doesNotUntap?: boolean
 }
 

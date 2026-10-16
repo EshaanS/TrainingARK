@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { useBuilderStore, type DecisionPoint } from './builderStore'
 import type { Card } from '@/types/board'
+import { detectCardMetadata } from '@/lib/triggerDetection'
 
 // `history` (the undo stack) lives in a module-level variable outside the
 // Zustand store, so it is not touched by `set()`/`getState()` resets. The
@@ -869,27 +870,211 @@ describe('doesNotUntap / setTriggerTag', () => {
   })
 })
 
-describe('searchLibrary', () => {
-  it('logs the search and fires an opponent-searches prompt for a matching watcher', () => {
+describe('opponent-searches fires when the searching object resolves, not when it goes on the stack', () => {
+  const archivist = () => card({ id: 'archivist', name: 'Archivist of Oghma', cardType: 'creature', triggerTag: { event: 'opponent-searches' } })
+  const stack = () => useBuilderStore.getState().stack
+  const prompt = () => useBuilderStore.getState().pendingTriggerPrompt
+  const resolveTop = () => useBuilderStore.getState().resolveStack(stack().at(-1)!.id)
+
+  it('cast path: casting a tutor offers nothing; resolving it offers the opposing Archivist, whose trigger lands after the tutor has left the stack', () => {
     withScenarioStarted()
-    withBattlefieldCards(1, [card({ id: 'archivist', name: 'Archivist of Oghma', cardType: 'creature', triggerTag: { event: 'opponent-searches' } })])
+    withBattlefieldCards(1, [archivist()])
+    withHandCards(0, [card({ id: 'tutor', name: 'Demonic Tutor', cardType: 'sorcery', searchesLibrary: true })])
 
-    useBuilderStore.getState().searchLibrary(0)
+    useBuilderStore.getState().castToStack(0, 'tutor', 'hand', 'cast')
+    expect(prompt()).toBeNull()
+    expect(stack().map(s => s.sourceCardName)).toEqual(['Demonic Tutor'])
 
-    expect(useBuilderStore.getState().logLines.at(-1)).toMatch(/searches their library/)
-    const prompt = useBuilderStore.getState().pendingTriggerPrompt
-    expect(prompt?.triggers).toHaveLength(1)
-    expect(prompt?.triggers[0].sourceCard.name).toBe('Archivist of Oghma')
+    resolveTop()
+    expect(prompt()?.triggers).toHaveLength(1)
+    expect(prompt()?.triggers[0].sourceCard.name).toBe('Archivist of Oghma')
+    expect(prompt()?.triggers[0].event).toBe('opponent-searches')
+    expect(useBuilderStore.getState().players![0].zones.graveyard.cards.map(c => c.name)).toEqual(['Demonic Tutor'])
+
+    useBuilderStore.getState().acceptPendingTriggers()
+    expect(stack().map(s => `${s.sourceCardName}:${s.type}`)).toEqual(['Archivist of Oghma:triggered'])
   })
 
-  it('is undoable', () => {
+  it('cast path: a tutor offers cast-event watchers at cast time and opponent-searches only at resolution', () => {
     withScenarioStarted()
-    const logLinesBefore = useBuilderStore.getState().logLines
-    useBuilderStore.getState().searchLibrary(0)
-    expect(useBuilderStore.getState().logLines).not.toEqual(logLinesBefore)
+    withBattlefieldCards(1, [
+      archivist(),
+      card({ id: 'rhystic', name: 'Rhystic Study', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } }),
+    ])
+    withHandCards(0, [card({ id: 'tutor', name: 'Vampiric Tutor', cardType: 'instant', searchesLibrary: true })])
 
-    useBuilderStore.getState().undoLastAction()
-    expect(useBuilderStore.getState().logLines).toEqual(logLinesBefore)
+    useBuilderStore.getState().castToStack(0, 'tutor', 'hand', 'cast')
+    expect(prompt()?.triggers.map(t => t.event)).toEqual(['opponent-casts'])
+    useBuilderStore.getState().dismissPendingTriggers()
+
+    resolveTop()
+    expect(prompt()?.triggers.map(t => t.event)).toEqual(['opponent-searches'])
+  })
+
+  it('cast path: a spell without searchesLibrary offers nothing when it resolves', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [archivist()])
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+    resolveTop()
+
+    expect(prompt()).toBeNull()
+  })
+
+  it('a countered tutor never searches, so it offers nothing', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [archivist()])
+    withHandCards(0, [card({ id: 'tutor', name: 'Demonic Tutor', cardType: 'sorcery', searchesLibrary: true })])
+
+    useBuilderStore.getState().castToStack(0, 'tutor', 'hand', 'cast')
+    useBuilderStore.getState().removeFromStack(stack().at(-1)!.id)
+
+    expect(prompt()).toBeNull()
+  })
+
+  it('activated path: activating a fetch land offers nothing; resolving the ability through the ability branch offers the opposing Archivist', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [archivist()])
+    withBattlefieldCards(0, [card({ id: 'tarn', name: 'Scalding Tarn', cardType: 'land', searchesLibrary: true })])
+    const countersBefore = useBuilderStore.getState().turnCounters
+
+    useBuilderStore.getState().castToStack(0, 'tarn', 'battlefield', 'activated')
+    expect(prompt()).toBeNull()
+    expect(stack().at(-1)?.type).toBe('activated')
+    expect(useBuilderStore.getState().players![0].zones.battlefield.cards.map(c => c.id)).toEqual(['tarn'])
+    expect(useBuilderStore.getState().turnCounters).toEqual(countersBefore)
+
+    resolveTop()
+    expect(stack()).toHaveLength(0)
+    expect(prompt()?.triggers).toHaveLength(1)
+    expect(prompt()?.triggers[0].sourceCard.name).toBe('Archivist of Oghma')
+    expect(useBuilderStore.getState().logLines.at(-1)).toMatch(/ability resolves/)
+  })
+
+  it('activated path: a permanent without searchesLibrary offers nothing when its ability resolves', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [archivist()])
+    withBattlefieldCards(0, [card({ id: 'boseiju', name: 'Boseiju, Who Endures', cardType: 'land' })])
+
+    useBuilderStore.getState().castToStack(0, 'boseiju', 'battlefield', 'activated')
+    resolveTop()
+
+    expect(prompt()).toBeNull()
+  })
+
+  it('"when this enters, search" creature: resolving the creature offers only its own ETB; resolving that ETB trigger offers Archivist', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [archivist()])
+    withHandCards(0, [card({ id: 'searcher', name: 'ETB Search Creature', cardType: 'creature', searchesLibrary: true, triggerTag: { event: 'permanent-etb-yours' } })])
+
+    useBuilderStore.getState().castToStack(0, 'searcher', 'hand', 'cast')
+    expect(prompt()).toBeNull()
+
+    resolveTop()
+    expect(prompt()?.triggers.map(t => `${t.sourceCard.name}:${t.event}`)).toEqual(['ETB Search Creature:permanent-etb-yours'])
+
+    useBuilderStore.getState().acceptPendingTriggers()
+    expect(prompt()).toBeNull()
+    resolveTop()
+    expect(prompt()?.triggers.map(t => `${t.sourceCard.name}:${t.event}`)).toEqual(['Archivist of Oghma:opponent-searches'])
+  })
+
+  it('a storm copy of a tutor offers Archivist as it resolves; the storm trigger itself does not', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [archivist()])
+    withBattlefieldCards(0, [card({ id: 'granter', name: 'Storm Granter', cardType: 'enchantment', grantsStorm: { toTypes: ['sorcery'] } })])
+    withHandCards(0, [
+      card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' }),
+      card({ id: 'tutor', name: 'Demonic Tutor', cardType: 'sorcery', searchesLibrary: true }),
+    ])
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+    useBuilderStore.getState().castToStack(0, 'tutor', 'hand', 'cast')
+    expect(stack().at(-1)?.stormCopyCount).toBe(1)
+
+    resolveTop()
+    expect(prompt()).toBeNull()
+    expect(stack().at(-1)?.isStormCopy).toBe(true)
+
+    resolveTop()
+    expect(prompt()?.triggers.map(t => t.sourceCard.name)).toEqual(['Archivist of Oghma'])
+  })
+
+  it('does not offer Archivist when its own controller searches (it watches opponents)', () => {
+    withScenarioStarted()
+    withBattlefieldCards(0, [archivist(), card({ id: 'tarn', name: 'Scalding Tarn', cardType: 'land', searchesLibrary: true })])
+
+    useBuilderStore.getState().castToStack(0, 'tarn', 'battlefield', 'activated')
+    resolveTop()
+
+    expect(prompt()).toBeNull()
+  })
+
+  it('offers nothing during setup, on either path', () => {
+    withBattlefieldCards(1, [archivist()])
+    withBattlefieldCards(0, [card({ id: 'tarn', name: 'Scalding Tarn', cardType: 'land', searchesLibrary: true })])
+    withHandCards(0, [card({ id: 'tutor', name: 'Demonic Tutor', cardType: 'sorcery', searchesLibrary: true })])
+
+    useBuilderStore.getState().castToStack(0, 'tarn', 'battlefield', 'activated')
+    useBuilderStore.getState().castToStack(0, 'tutor', 'hand', 'cast')
+    resolveTop()
+    resolveTop()
+
+    expect(stack()).toHaveLength(0)
+    expect(prompt()).toBeNull()
+  })
+})
+
+describe('second-card-each-turn draw triggers, end to end from real oracle text', () => {
+  // Verbatim Scryfall oracle text.
+  const FAERIE_MASTERMIND = 'Flash\nFlying\nWhenever an opponent draws their second card each turn, you draw a card.\n{3}{U}: Each player draws a card.'
+  const GLEAMING_SPLENDOR = 'Whenever an opponent draws their second card each turn, you create a Treasure token.\n{2}{W}: Two target players each draw a card.'
+
+  function withLibrary(playerIndex: 0 | 1 | 2 | 3, count: number) {
+    const players = useBuilderStore.getState().players!
+    const updated = [...players] as typeof players
+    const cards = Array.from({ length: count }, (_, i) => card({ id: `lib-${playerIndex}-${i}`, name: 'Island', cardType: 'land' }))
+    updated[playerIndex] = { ...updated[playerIndex], zones: { ...updated[playerIndex].zones, library: { cards, revealed: false, cardCount: count } } }
+    useBuilderStore.setState({ players: updated })
+  }
+
+  it.each([
+    ['Faerie Mastermind', FAERIE_MASTERMIND],
+    ['Gleaming Splendor', GLEAMING_SPLENDOR],
+  ])('%s does not fire on an opponent\'s first draw of the turn and does fire on their second', (name, oracleText) => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher', name, cardType: 'enchantment', ...detectCardMetadata(oracleText) })])
+    withLibrary(0, 3)
+
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers.map(t => t.sourceCard.name)).toEqual([name])
+  })
+
+  it('counts draws per player: another opponent\'s first draw does not advance the first opponent toward "second card"', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher', name: 'Faerie Mastermind', cardType: 'creature', ...detectCardMetadata(FAERIE_MASTERMIND) })])
+    withLibrary(0, 3)
+    withLibrary(2, 3)
+
+    useBuilderStore.getState().drawCard(0)
+    useBuilderStore.getState().drawCard(2)
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+  })
+
+  it('does not fire again on a third draw', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher', name: 'Gleaming Splendor', cardType: 'enchantment', ...detectCardMetadata(GLEAMING_SPLENDOR) })])
+    withLibrary(0, 3)
+
+    useBuilderStore.getState().drawCard(0)
+    useBuilderStore.getState().drawCard(0)
+    useBuilderStore.getState().dismissPendingTriggers()
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
   })
 })
 
