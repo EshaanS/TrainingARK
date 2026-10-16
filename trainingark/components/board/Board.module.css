@@ -102,3 +102,36 @@
     color: #c9a84c;
     border-color: #c9a84c;
 }
+
+.stormStepper {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+}
+
+.stormStepperBtn {
+    background: rgba(0, 0, 0, 0.78);
+    border: 1px solid rgba(232, 201, 106, 0.5);
+    color: #e8c96a;
+    font-size: 0.7rem;
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    line-height: 1;
+}
+
+.stormStepperBtn:hover {
+    background: rgba(232, 201, 106, 0.2);
+}
+
+.stormCount {
+    color: #e8c96a;
+    font-size: 0.62rem;
+    font-weight: 600;
+}

@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import Image from 'next/image'
 import type { Player } from '@/types/board'
+import { detectCardMetadata } from '@/lib/triggerDetection'
 import styles from './CommanderSetupModal.module.css'
 
 const BASIC_LANDS = new Set([
@@ -15,6 +16,7 @@ interface CommanderInfo {
 	name: string
 	imageUrl: string
 	oracleText: string
+	keywords?: unknown
 	partnerType: 'none' | 'partner' | 'partner-with' | 'background' | 'friends-forever' | 'choose-background'
 	partnerWith?: string
 }
@@ -32,6 +34,7 @@ async function fetchCommanderInfo(name: string): Promise<CommanderInfo | null> {
 		const data = await res.json()
 		const oracle: string = data.oracle_text ?? data.card_faces?.[0]?.oracle_text ?? ''
 		const imageUrl: string = data.image_uris?.normal ?? data.card_faces?.[0]?.image_uris?.normal ?? ''
+		const keywords: unknown = data.keywords ?? data.card_faces?.[0]?.keywords
 
 		let partnerType: CommanderInfo['partnerType'] = 'none'
 		let partnerWith: string | undefined
@@ -50,7 +53,7 @@ async function fetchCommanderInfo(name: string): Promise<CommanderInfo | null> {
 			partnerType = 'partner'
 		}
 
-		return { name, imageUrl, oracleText: oracle, partnerType, partnerWith }
+		return { name, imageUrl, oracleText: oracle, keywords, partnerType, partnerWith }
 	} catch {
 		return null
 	}
@@ -201,13 +204,17 @@ export function CommanderSetupModal({ playerIndex, playerName, onConfirm }: Comm
 		const commanderNames = [commander1.name]
 		if (commander2) commanderNames.push(commander2.name)
 
-		const commanderCards = commanderNames.map((name, i) => ({
-		id: `cmd-${playerIndex}-${i}`,
-		name,
-		cardType: 'creature' as const,
-		imageUrl: i === 0 ? commander1.imageUrl : (commander2?.imageUrl ?? ''),
-		isCommander: true,
-		}))
+		const commanderCards = commanderNames.map((name, i) => {
+		const info = i === 0 ? commander1 : commander2
+		return {
+			id: `cmd-${playerIndex}-${i}`,
+			name,
+			cardType: 'creature' as const,
+			imageUrl: info?.imageUrl ?? '',
+			isCommander: true,
+			...detectCardMetadata(info?.oracleText, info?.keywords),
+		}
+		})
 
 		const commanderTax: number | [number, number] = commander2 ? [0, 0] : 0
 		const libraryCount = 100 - commanderNames.length

@@ -3,6 +3,7 @@
 import { useBuilderStore } from '@/store/builderStore'
 import type { Player, StackItem } from '@/types/board'
 import { PlayerZone } from './PlayerZone'
+import { TriggerPrompt } from './TriggerPrompt'
 import styles from './Board.module.css'
 
 interface BoardProps {
@@ -18,7 +19,7 @@ interface BoardProps {
 }
 
 export function Board({ revealAll, viewMode, snapshot }: BoardProps) {
-  const { stack: storeStack, resolveStack, removeFromStack, exileFromStack } = useBuilderStore()
+  const { stack: storeStack, resolveStack, removeFromStack, exileFromStack, setStormCopyCount } = useBuilderStore()
 
   const stack = viewMode && snapshot ? snapshot.stack : storeStack
 
@@ -40,6 +41,25 @@ export function Board({ revealAll, viewMode, snapshot }: BoardProps) {
                 </span>
                 <span className={styles.stackName}>{item.sourceCardName}</span>
                 <span className={styles.stackController}>{item.controller}</span>
+                {!viewMode && item.stormCopyCount !== undefined && (
+                  <div className={styles.stormStepper}>
+                    <button
+                      className={styles.stormStepperBtn}
+                      onClick={() => setStormCopyCount(item.id, item.stormCopyCount! - 1)}
+                      title="Decrease locked copy count"
+                    >
+                      −
+                    </button>
+                    <span className={styles.stormCount}>×{item.stormCopyCount}</span>
+                    <button
+                      className={styles.stormStepperBtn}
+                      onClick={() => setStormCopyCount(item.id, item.stormCopyCount! + 1)}
+                      title="Increase locked copy count"
+                    >
+                      +
+                    </button>
+                  </div>
+                )}
                 {!viewMode && idx === 0 && (
                   <div className={styles.stackActions}>
                     <button onClick={() => resolveStack(item.id)} title="Resolve">✓</button>
@@ -53,6 +73,8 @@ export function Board({ revealAll, viewMode, snapshot }: BoardProps) {
             ))}
           </div>
         )}
+
+        {!viewMode && <TriggerPrompt />}
       </div>
     </div>
   )

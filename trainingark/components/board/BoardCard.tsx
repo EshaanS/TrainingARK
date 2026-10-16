@@ -3,8 +3,9 @@
 import { useState, useEffect, useRef } from 'react'
 import Image from 'next/image'
 import { createPortal } from 'react-dom'
-import type { Card } from '@/types/board'
+import type { Card, TriggerTag } from '@/types/board'
 import { CardContextMenu, type ZoneTarget, type StackType } from './CardContextMenu'
+import { EVENT_TYPE_LABELS } from '@/lib/triggerDetection'
 import styles from './BoardCard.module.css'
 import type { EditableZone } from '@/store/builderStore'
 
@@ -18,6 +19,8 @@ interface BoardCardProps {
   // Only passed for opponent seats; its absence is what hides the reveal
   // toggle on the player's own cards.
   onToggleRevealed?: () => void
+  onToggleDoesNotUntap?: () => void
+  onSetTriggerTag?: (tag?: TriggerTag) => void
   onIncrement?: () => void
   onDecrement?: () => void
   currentZone: EditableZone
@@ -32,7 +35,7 @@ const CARD_BACK = '/back_magic.png'
 
 export function BoardCard({
   card, onMove, onCastToStack, onRemove, onCreateTokenCopy,
-  onToggleTapped, onToggleRevealed,
+  onToggleTapped, onToggleRevealed, onToggleDoesNotUntap, onSetTriggerTag,
   onIncrement, onDecrement,
   currentZone, compact, showRemoveX, readOnly,
 }: BoardCardProps) {
@@ -91,10 +94,14 @@ export function BoardCard({
       isCommander={card.isCommander}
       isTapped={card.tapped}
       isRevealed={card.revealed}
+      isDoesNotUntap={card.doesNotUntap}
+      triggerTag={card.triggerTag}
       onMove={t => onMove?.(t)}
       onCastToStack={t => onCastToStack?.(t)}
       onToggleTapped={onToggleTapped}
       onToggleRevealed={onToggleRevealed}
+      onToggleDoesNotUntap={onToggleDoesNotUntap}
+      onSetTriggerTag={onSetTriggerTag}
       onRemove={() => onRemove?.()}
       onCreateTokenCopy={onCreateTokenCopy}
       onClose={() => setContextMenu(null)}
@@ -158,6 +165,14 @@ export function BoardCard({
             while hovered so it never sits under the ⋮ / × buttons. */}
         {!readOnly && card.revealed && !hovered && (
           <div className={styles.revealBadge} title="Revealed to viewer">◉</div>
+        )}
+
+        {!readOnly && !hovered && card.doesNotUntap && currentZone === 'battlefield' && (
+          <div className={styles.doesNotUntapBadge} title="Does not untap">⊘</div>
+        )}
+
+        {!readOnly && !hovered && card.triggerTag && !isToken && (
+          <div className={styles.triggerTagBadge} title={EVENT_TYPE_LABELS[card.triggerTag.event]}>⟳</div>
         )}
 
         {!readOnly && hovered && isToken && (onIncrement || onDecrement) && (

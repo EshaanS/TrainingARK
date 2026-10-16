@@ -10,6 +10,7 @@ import type { ZoneTarget, StackType } from './CardContextMenu'
 import { ZoneMenu, type ZoneMenuItem } from './ZoneMenu'
 import { CommanderSetupModal } from './CommanderSetupModal'
 import { useBuilderStore, makeUnknownCard, type EditableZone } from '@/store/builderStore'
+import { detectCardMetadata } from '@/lib/triggerDetection'
 
 interface PlayerZoneProps {
   playerIndex: number
@@ -74,11 +75,14 @@ async function fetchDecklistCards(lines: string[]): Promise<Card[]> {
       if (!res.ok) continue
       const data = await res.json()
       for (const card of (data.data ?? [])) {
+        const oracleText = card.oracle_text ?? card.card_faces?.[0]?.oracle_text
+        const keywords = card.keywords ?? card.card_faces?.[0]?.keywords
         results.push({
           id: card.id,
           name: card.name,
           imageUrl: card.image_uris?.normal ?? card.card_faces?.[0]?.image_uris?.normal,
           cardType: parseCardType(card.type_line ?? ''),
+          ...detectCardMetadata(oracleText, keywords),
         })
       }
     } catch { /* skip failed batch */ }
@@ -90,9 +94,11 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const {
     players, updatePlayer, confirmSetup, setupComplete,
     moveCard, moveAllCards, addCard, castToStack, setLife, setTax, setTaxPartner,
-    decklists, drawCard, shuffleLibrary, removeCard, createTokenCopy,
+    decklists, drawCard, searchLibrary, shuffleLibrary, removeCard, createTokenCopy,
     incrementToken, decrementToken, toggleTapped, toggleRevealed,
+    toggleDoesNotUntap, setTriggerTag,
     handSizes, setHandSize,
+    turnCounters, setSpellsCastThisTurn, setCardsDrawnThisTurn,
     isDuplicate, dismissDuplicateWarning, dismissedDuplicateWarnings,
     populateLibrary,
   } = useBuilderStore()
@@ -112,6 +118,10 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const [taxInput, setTaxInput] = useState('')
   const [editingHandSize, setEditingHandSize] = useState(false)
   const [handSizeInput, setHandSizeInput] = useState('')
+  const [editingSpellsCast, setEditingSpellsCast] = useState(false)
+  const [spellsCastInput, setSpellsCastInput] = useState('')
+  const [editingCardsDrawn, setEditingCardsDrawn] = useState(false)
+  const [cardsDrawnInput, setCardsDrawnInput] = useState('')
   const [zoneMenu, setZoneMenu] = useState<{ x: number; y: number; items: ZoneMenuItem[] } | null>(null)
   const [editPoolLoading, setEditPoolLoading] = useState(false)
   const [showEditPool, setShowEditPool] = useState(false)
@@ -252,6 +262,18 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
       setTax(playerIndex, val)
     }
     setEditingTax(null)
+  }
+
+  function commitSpellsCast() {
+    const val = parseInt(spellsCastInput)
+    if (!isNaN(val)) setSpellsCastThisTurn(playerIndex, val)
+    setEditingSpellsCast(false)
+  }
+
+  function commitCardsDrawn() {
+    const val = parseInt(cardsDrawnInput)
+    if (!isNaN(val)) setCardsDrawnThisTurn(playerIndex, val)
+    setEditingCardsDrawn(false)
   }
 
   function commitHandSize() {
@@ -508,6 +530,7 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
         { label: 'Move all to Graveyard', action: () => moveAllFromZone('library', 'graveyard') },
         { label: 'Move all to Exile', action: () => moveAllFromZone('library', 'exile') },
         { label: 'Shuffle', action: () => shuffleLibrary(playerIndex) },
+        { label: 'Declare Library Search', action: () => searchLibrary(playerIndex) },
       ], libraryAddBtnRef, () => { const r = libraryAddBtnRef.current?.getBoundingClientRect(); if (r) handleAddCard('library', r) })}
       {fetchingCards && !viewMode ? (
         <div className={styles.emptyPile} style={{ width: 'var(--card-w)', height: 'var(--card-h)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -736,6 +759,44 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
           Max: {handSizes[playerIndex]}
         </span>
       ))}
+      {!viewMode && (editingSpellsCast ? (
+        <input
+          className={styles.inlineInput}
+          type="number"
+          value={spellsCastInput}
+          onChange={e => setSpellsCastInput(e.target.value)}
+          onBlur={commitSpellsCast}
+          onKeyDown={e => { if (e.key === 'Enter') commitSpellsCast(); if (e.key === 'Escape') setEditingSpellsCast(false) }}
+          autoFocus
+        />
+      ) : (
+        <span
+          className={styles.playerHandSize}
+          onClick={() => { setSpellsCastInput(String(turnCounters.spellsCastThisTurn[playerIndex])); setEditingSpellsCast(true) }}
+          title="Click to edit — spells cast this turn"
+        >
+          Spells: {turnCounters.spellsCastThisTurn[playerIndex]}
+        </span>
+      ))}
+      {!viewMode && (editingCardsDrawn ? (
+        <input
+          className={styles.inlineInput}
+          type="number"
+          value={cardsDrawnInput}
+          onChange={e => setCardsDrawnInput(e.target.value)}
+          onBlur={commitCardsDrawn}
+          onKeyDown={e => { if (e.key === 'Enter') commitCardsDrawn(); if (e.key === 'Escape') setEditingCardsDrawn(false) }}
+          autoFocus
+        />
+      ) : (
+        <span
+          className={styles.playerHandSize}
+          onClick={() => { setCardsDrawnInput(String(turnCounters.cardsDrawnThisTurn[playerIndex])); setEditingCardsDrawn(true) }}
+          title="Click to edit — cards drawn this turn"
+        >
+          Drawn: {turnCounters.cardsDrawnThisTurn[playerIndex]}
+        </span>
+      ))}
     </div>
   )
 
@@ -772,6 +833,8 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
           onCreateTokenCopy={() => handleTokenCopy(card.id)}
           onToggleTapped={() => { if (!viewMode) toggleTapped(playerIndex, card.id) }}
           onToggleRevealed={revealHandler(card.id)}
+          onToggleDoesNotUntap={() => { if (!viewMode) toggleDoesNotUntap(playerIndex, card.id) }}
+          onSetTriggerTag={tag => { if (!viewMode) setTriggerTag(playerIndex, card.id, tag) }}
           onIncrement={!viewMode && card.isToken ? () => incrementToken(playerIndex, card.id) : undefined}
           onDecrement={!viewMode && card.isToken ? () => decrementToken(playerIndex, card.id) : undefined}
           showRemoveX
@@ -1172,6 +1235,10 @@ function CardAddSearch({ decklist, tokensOnly, onSelect, onClose }: {
         })(),
         cardType: parseCardType(cardData.type_line ?? ''),
         isToken: tokensOnly ? true : undefined,
+        ...detectCardMetadata(
+          cardData.oracle_text ?? cardData.card_faces?.[0]?.oracle_text,
+          cardData.keywords ?? cardData.card_faces?.[0]?.keywords
+        ),
       }
       onSelect(card)
     } catch { /* ignore */ }

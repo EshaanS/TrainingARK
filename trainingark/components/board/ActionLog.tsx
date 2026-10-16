@@ -19,6 +19,7 @@ export function ActionLog() {
   const {
     logLines, editLogLine, removeLogLine, undoLastAction, scenarioStarted, startScenario,
     players, firstPlayerIndex, currentTurnPlayerIndex, turnNumber, handSizes,
+    turnCounters, setTotalSpellsCastThisTurn,
     setFirstPlayer, setCurrentTurnPlayer, setTurnNumber, passTurn, moveCard,
     steps, saveStep, deleteStep, lastSavedLogIndex,
   } = useBuilderStore()
@@ -348,6 +349,15 @@ export function ActionLog() {
                 min={1}
                 value={turnNumber}
                 onChange={e => setTurnNumber(Math.max(1, parseInt(e.target.value) || 1))}
+              />
+
+              <label className={styles.turnLabel}>Total spells cast this turn</label>
+              <input
+                className={styles.turnNumberInput}
+                type="number"
+                min={0}
+                value={turnCounters.totalSpellsCastThisTurn}
+                onChange={e => setTotalSpellsCastThisTurn(Math.max(0, parseInt(e.target.value) || 0))}
               />
             </div>
 

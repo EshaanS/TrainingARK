@@ -126,6 +126,34 @@
   line-height: 1.4;
 }
 
+.doesNotUntapBadge {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  background: rgba(0, 0, 0, 0.78);
+  color: #e8c96a;
+  font-size: 0.6rem;
+  padding: 1px 4px;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 3;
+  line-height: 1.4;
+}
+
+.triggerTagBadge {
+  position: absolute;
+  bottom: 3px;
+  right: 3px;
+  background: rgba(0, 0, 0, 0.78);
+  color: #e8c96a;
+  font-size: 0.6rem;
+  padding: 1px 4px;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 3;
+  line-height: 1.4;
+}
+
 .tokenControls {
   position: absolute;
   bottom: 4px;

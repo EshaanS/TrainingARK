@@ -558,3 +558,437 @@ describe('undoLastAction', () => {
     expect(useBuilderStore.getState().logLines).toEqual(logLinesBefore)
   })
 })
+
+function withHandCards(playerIndex: 0 | 1 | 2 | 3, cards: Card[]) {
+  const players = useBuilderStore.getState().players!
+  const updated = [...players] as typeof players
+  updated[playerIndex] = {
+    ...players[playerIndex],
+    zones: { ...players[playerIndex].zones, hand: { cards, revealed: false, cardCount: cards.length } },
+  }
+  useBuilderStore.setState({ players: updated })
+}
+
+function withBattlefieldCards(playerIndex: 0 | 1 | 2 | 3, cards: Card[]) {
+  const players = useBuilderStore.getState().players!
+  const updated = [...players] as typeof players
+  updated[playerIndex] = {
+    ...players[playerIndex],
+    zones: { ...players[playerIndex].zones, battlefield: { cards, revealed: true } },
+  }
+  useBuilderStore.setState({ players: updated })
+}
+
+describe('turn counters: auto-increment on cast/draw, reset on passTurn', () => {
+  it('does not increment counters or create a prompt while the scenario has not started', () => {
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    const { turnCounters, pendingTriggerPrompt } = useBuilderStore.getState()
+    expect(turnCounters.spellsCastThisTurn).toEqual([0, 0, 0, 0])
+    expect(turnCounters.totalSpellsCastThisTurn).toBe(0)
+    expect(pendingTriggerPrompt).toBeNull()
+  })
+
+  it('increments spellsCastThisTurn and totalSpellsCastThisTurn on a real cast once the scenario has started', () => {
+    withScenarioStarted()
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    const { turnCounters } = useBuilderStore.getState()
+    expect(turnCounters.spellsCastThisTurn[0]).toBe(1)
+    expect(turnCounters.totalSpellsCastThisTurn).toBe(1)
+  })
+
+  it('does not touch spell counters for "triggered"/"activated" castToStack calls', () => {
+    withScenarioStarted()
+    withBattlefieldCards(0, [card({ id: 'perm1', name: 'Bear', cardType: 'creature' })])
+    useBuilderStore.getState().castToStack(0, 'perm1', 'battlefield', 'triggered')
+
+    expect(useBuilderStore.getState().turnCounters.totalSpellsCastThisTurn).toBe(0)
+  })
+
+  it('increments cardsDrawnThisTurn on drawCard once the scenario has started, not before', () => {
+    withHandCards(0, [])
+    const players = useBuilderStore.getState().players!
+    const updated = [...players] as typeof players
+    updated[0] = { ...players[0], zones: { ...players[0].zones, library: { cards: [card({ id: 'lib1', name: 'Island', cardType: 'land' }), card({ id: 'lib2', name: 'Forest', cardType: 'land' })], revealed: false, cardCount: 2 } } }
+    useBuilderStore.setState({ players: updated })
+
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().turnCounters.cardsDrawnThisTurn[0]).toBe(0)
+
+    withScenarioStarted()
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().turnCounters.cardsDrawnThisTurn[0]).toBe(1)
+  })
+
+  it('passTurn resets all three counters to zero for every player', () => {
+    withScenarioStarted()
+    useBuilderStore.setState({
+      turnCounters: { spellsCastThisTurn: [3, 1, 0, 2], totalSpellsCastThisTurn: 6, cardsDrawnThisTurn: [2, 0, 1, 0] },
+    })
+
+    useBuilderStore.getState().passTurn()
+
+    expect(useBuilderStore.getState().turnCounters).toEqual({
+      spellsCastThisTurn: [0, 0, 0, 0],
+      totalSpellsCastThisTurn: 0,
+      cardsDrawnThisTurn: [0, 0, 0, 0],
+    })
+  })
+})
+
+describe('pending trigger prompts', () => {
+  it('creates a prompt when an opponent casts a spell with a matching watcher on the battlefield', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher1', name: 'Rhystic Study', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } })])
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    const prompt = useBuilderStore.getState().pendingTriggerPrompt
+    expect(prompt?.triggers).toHaveLength(1)
+    expect(prompt?.triggers[0].sourceCard.name).toBe('Rhystic Study')
+    expect(prompt?.triggers[0].event).toBe('opponent-casts')
+  })
+
+  it('merges a single matched event into one combined prompt when a noncreature cast matches two different tag categories', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [
+      card({ id: 'watcher1', name: 'Rhystic Study', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } }),
+      card({ id: 'watcher2', name: 'Mystic Remora', cardType: 'enchantment', triggerTag: { event: 'opponent-casts-noncreature', qualifier: 'noncreature' } }),
+    ])
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    const prompt = useBuilderStore.getState().pendingTriggerPrompt
+    expect(prompt?.triggers.map(t => t.sourceCard.name).sort()).toEqual(['Mystic Remora', 'Rhystic Study'])
+  })
+
+  it('does not offer a noncreature-only watcher when the cast spell is a creature', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher2', name: 'Mystic Remora', cardType: 'enchantment', triggerTag: { event: 'opponent-casts-noncreature', qualifier: 'noncreature' } })])
+    withHandCards(0, [card({ id: 'spell1', name: 'Bear', cardType: 'creature' })])
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+  })
+
+  it('acceptPendingTriggers pushes a "triggered" item above the spell and clears the prompt', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher1', name: 'Rhystic Study', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } })])
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    useBuilderStore.getState().acceptPendingTriggers()
+
+    const stack = useBuilderStore.getState().stack
+    expect(stack).toHaveLength(2)
+    expect(stack[1].sourceCardName).toBe('Rhystic Study')
+    expect(stack[1].type).toBe('triggered')
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+  })
+
+  it('dismissPendingTriggers clears the prompt without touching the stack', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher1', name: 'Rhystic Study', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } })])
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+
+    useBuilderStore.getState().dismissPendingTriggers()
+
+    expect(useBuilderStore.getState().stack).toHaveLength(1)
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+  })
+
+  it('remembers an ordering preference the first time two triggers match the same event, and reuses it without asking again', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [
+      card({ id: 'watcherA', name: 'WatcherA', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } }),
+      card({ id: 'watcherB', name: 'WatcherB', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } }),
+    ])
+    withHandCards(0, [
+      card({ id: 'spell1', name: 'Bolt1', cardType: 'instant' }),
+      card({ id: 'spell2', name: 'Bolt2', cardType: 'instant' }),
+    ])
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers).toHaveLength(2)
+    useBuilderStore.getState().acceptPendingTriggers('first-listed-first')
+
+    expect(useBuilderStore.getState().triggerStackOrder).toBe('first-listed-first')
+    let stack = useBuilderStore.getState().stack
+    expect(stack[stack.length - 1].sourceCardName).toBe('WatcherA')
+    expect(stack[stack.length - 2].sourceCardName).toBe('WatcherB')
+
+    // Second multi-trigger prompt: no explicit order passed this time — the
+    // remembered preference from the first prompt must still apply.
+    useBuilderStore.getState().castToStack(0, 'spell2', 'hand', 'cast')
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers).toHaveLength(2)
+    useBuilderStore.getState().acceptPendingTriggers()
+
+    stack = useBuilderStore.getState().stack
+    expect(stack[stack.length - 1].sourceCardName).toBe('WatcherA')
+    expect(stack[stack.length - 2].sourceCardName).toBe('WatcherB')
+  })
+
+  it('merges a second triggering action into an already-pending prompt instead of overwriting it', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [
+      card({ id: 'watcherCast', name: 'WatcherCast', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } }),
+      card({ id: 'watcherDraw', name: 'WatcherDraw', cardType: 'enchantment', triggerTag: { event: 'opponent-draws' } }),
+    ])
+    withHandCards(0, [card({ id: 'spell1', name: 'Bolt1', cardType: 'instant' })])
+    const players = useBuilderStore.getState().players!
+    const updated = [...players] as typeof players
+    updated[0] = { ...updated[0], zones: { ...updated[0].zones, library: { cards: [card({ id: 'lib1', name: 'Island', cardType: 'land' })], revealed: false, cardCount: 1 } } }
+    useBuilderStore.setState({ players: updated })
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers).toHaveLength(1)
+
+    useBuilderStore.getState().drawCard(0)
+
+    const prompt = useBuilderStore.getState().pendingTriggerPrompt
+    expect(prompt?.triggers.map(t => t.sourceCard.name).sort()).toEqual(['WatcherCast', 'WatcherDraw'])
+  })
+})
+
+describe('storm', () => {
+  it('locks the storm copy count to the number of spells cast BEFORE the storm spell, excluding itself', () => {
+    withScenarioStarted()
+    withHandCards(0, [
+      card({ id: 'bolt1', name: 'Bolt1', cardType: 'instant' }),
+      card({ id: 'bolt2', name: 'Bolt2', cardType: 'instant' }),
+      card({ id: 'storm1', name: 'Grapeshot', cardType: 'instant', hasStorm: true }),
+    ])
+
+    useBuilderStore.getState().castToStack(0, 'bolt1', 'hand', 'cast')
+    useBuilderStore.getState().castToStack(0, 'bolt2', 'hand', 'cast')
+    useBuilderStore.getState().castToStack(0, 'storm1', 'hand', 'cast')
+
+    const stack = useBuilderStore.getState().stack
+    expect(stack).toHaveLength(4)
+    const stormTrigger = stack[3]
+    expect(stormTrigger.sourceCardName).toBe('Grapeshot')
+    expect(stormTrigger.stormCopyCount).toBe(2)
+    expect(useBuilderStore.getState().turnCounters.totalSpellsCastThisTurn).toBe(3)
+  })
+
+  it('also triggers storm when a battlefield permanent grants it to the cast card\'s type', () => {
+    withScenarioStarted()
+    withBattlefieldCards(0, [card({ id: 'granter', name: 'Prismari, the Inspiration', cardType: 'enchantment', grantsStorm: { toTypes: ['instant', 'sorcery'] } })])
+    withHandCards(0, [card({ id: 'bolt1', name: 'Shock', cardType: 'instant' })])
+
+    useBuilderStore.getState().castToStack(0, 'bolt1', 'hand', 'cast')
+
+    const stack = useBuilderStore.getState().stack
+    expect(stack).toHaveLength(2)
+    expect(stack[1].stormCopyCount).toBe(0)
+  })
+
+  it('resolving the storm trigger fans out into N separate isStormCopy stack items, not one grouped item', () => {
+    withScenarioStarted()
+    const sourceCard = card({ id: 'storm1', name: 'Grapeshot', cardType: 'instant', hasStorm: true })
+    const stormTrigger = {
+      id: 'storm-trigger-1', sourceCardId: 'storm1', sourceCardName: 'Grapeshot', controller: 'Player',
+      label: 'Grapeshot', type: 'triggered' as const, cardType: 'instant' as const, sourceCard, stormCopyCount: 2,
+    }
+    useBuilderStore.setState({ stack: [stormTrigger] })
+
+    useBuilderStore.getState().resolveStack('storm-trigger-1')
+
+    const stack = useBuilderStore.getState().stack
+    const copies = stack.filter(s => s.isStormCopy)
+    expect(copies).toHaveLength(2)
+    expect(copies[0].id).not.toBe(copies[1].id)
+    expect(copies.every(c => c.sourceCardName === 'Grapeshot')).toBe(true)
+  })
+
+  function makeStormCopy(id: string) {
+    return { id, sourceCardId: 'storm1', sourceCardName: 'Grapeshot', controller: 'Player', label: 'Grapeshot', type: 'cast' as const, cardType: 'instant' as const, isStormCopy: true }
+  }
+
+  it('a resolved storm copy ceases to exist without landing in a zone', () => {
+    withScenarioStarted()
+    useBuilderStore.setState({ stack: [makeStormCopy('copy-1')] })
+    useBuilderStore.getState().resolveStack('copy-1')
+    expect(useBuilderStore.getState().stack).toHaveLength(0)
+    expect(useBuilderStore.getState().players![0].zones.battlefield.cards).toHaveLength(0)
+    expect(useBuilderStore.getState().players![0].zones.graveyard.cards).toHaveLength(0)
+  })
+
+  it('a countered storm copy ceases to exist without landing in the graveyard', () => {
+    withScenarioStarted()
+    useBuilderStore.setState({ stack: [makeStormCopy('copy-2')] })
+    useBuilderStore.getState().removeFromStack('copy-2')
+    expect(useBuilderStore.getState().stack).toHaveLength(0)
+    expect(useBuilderStore.getState().players![0].zones.graveyard.cards).toHaveLength(0)
+  })
+
+  it('an exiled storm copy ceases to exist without landing in exile', () => {
+    withScenarioStarted()
+    useBuilderStore.setState({ stack: [makeStormCopy('copy-3')] })
+    useBuilderStore.getState().exileFromStack('copy-3')
+    expect(useBuilderStore.getState().stack).toHaveLength(0)
+    expect(useBuilderStore.getState().players![0].zones.exile.cards).toHaveLength(0)
+  })
+})
+
+describe('doesNotUntap / setTriggerTag', () => {
+  it('toggleDoesNotUntap only affects a card on the battlefield', () => {
+    withBattlefieldCards(0, [card({ id: 'vault1', name: 'Mana Vault', cardType: 'artifact' })])
+
+    useBuilderStore.getState().toggleDoesNotUntap(0, 'vault1')
+    expect(useBuilderStore.getState().players![0].zones.battlefield.cards[0].doesNotUntap).toBe(true)
+
+    useBuilderStore.getState().toggleDoesNotUntap(0, 'vault1')
+    expect(useBuilderStore.getState().players![0].zones.battlefield.cards[0].doesNotUntap).toBe(false)
+  })
+
+  it('toggleDoesNotUntap is a no-op for a card that is not on the battlefield', () => {
+    withHandCards(0, [card({ id: 'vault1', name: 'Mana Vault', cardType: 'artifact' })])
+    const before = useBuilderStore.getState().players
+
+    useBuilderStore.getState().toggleDoesNotUntap(0, 'vault1')
+
+    expect(useBuilderStore.getState().players).toEqual(before)
+  })
+
+  it('setTriggerTag sets and clears a tag on a card in any zone', () => {
+    withHandCards(0, [card({ id: 'card1', name: 'Mulldrifter', cardType: 'creature' })])
+
+    useBuilderStore.getState().setTriggerTag(0, 'card1', { event: 'permanent-etb-yours' })
+    expect(useBuilderStore.getState().players![0].zones.hand.cards[0].triggerTag).toEqual({ event: 'permanent-etb-yours' })
+
+    useBuilderStore.getState().setTriggerTag(0, 'card1', undefined)
+    expect(useBuilderStore.getState().players![0].zones.hand.cards[0].triggerTag).toBeUndefined()
+  })
+})
+
+describe('searchLibrary', () => {
+  it('logs the search and fires an opponent-searches prompt for a matching watcher', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'archivist', name: 'Archivist of Oghma', cardType: 'creature', triggerTag: { event: 'opponent-searches' } })])
+
+    useBuilderStore.getState().searchLibrary(0)
+
+    expect(useBuilderStore.getState().logLines.at(-1)).toMatch(/searches their library/)
+    const prompt = useBuilderStore.getState().pendingTriggerPrompt
+    expect(prompt?.triggers).toHaveLength(1)
+    expect(prompt?.triggers[0].sourceCard.name).toBe('Archivist of Oghma')
+  })
+
+  it('is undoable', () => {
+    withScenarioStarted()
+    const logLinesBefore = useBuilderStore.getState().logLines
+    useBuilderStore.getState().searchLibrary(0)
+    expect(useBuilderStore.getState().logLines).not.toEqual(logLinesBefore)
+
+    useBuilderStore.getState().undoLastAction()
+    expect(useBuilderStore.getState().logLines).toEqual(logLinesBefore)
+  })
+})
+
+describe('undoLastAction restores turnCounters', () => {
+  it('reverts counters incremented by a cast', () => {
+    withScenarioStarted()
+    withHandCards(0, [card({ id: 'spell1', name: 'Lightning Bolt', cardType: 'instant' })])
+    const countersBefore = useBuilderStore.getState().turnCounters
+
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+    expect(useBuilderStore.getState().turnCounters).not.toEqual(countersBefore)
+
+    useBuilderStore.getState().undoLastAction()
+    expect(useBuilderStore.getState().turnCounters).toEqual(countersBefore)
+  })
+})
+
+describe('ordinal gate uses the counter matching the event kind', () => {
+  it('gates a draw-based spellNumber tag against cardsDrawnThisTurn, not spellsCastThisTurn', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'watcher', name: 'Second Card Watcher', cardType: 'enchantment', triggerTag: { event: 'opponent-draws', spellNumber: 2 } })])
+    withHandCards(0, [
+      card({ id: 'spell1', name: 'Bolt1', cardType: 'instant' }),
+      card({ id: 'spell2', name: 'Bolt2', cardType: 'instant' }),
+    ])
+    const players = useBuilderStore.getState().players!
+    const updated = [...players] as typeof players
+    updated[0] = { ...updated[0], zones: { ...updated[0].zones, library: { cards: [card({ id: 'lib1', name: 'Island', cardType: 'land' }), card({ id: 'lib2', name: 'Forest', cardType: 'land' })], revealed: false, cardCount: 2 } } }
+    useBuilderStore.setState({ players: updated })
+
+    // spellsCastThisTurn[0] reaches 2 first — if the ordinal gate incorrectly
+    // read the spell counter, this would wrongly match already.
+    useBuilderStore.getState().castToStack(0, 'spell1', 'hand', 'cast')
+    useBuilderStore.getState().castToStack(0, 'spell2', 'hand', 'cast')
+    expect(useBuilderStore.getState().turnCounters.spellsCastThisTurn[0]).toBe(2)
+
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+
+    useBuilderStore.getState().drawCard(0)
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers).toHaveLength(1)
+  })
+})
+
+describe('ETB, creature-dies, and your-upkeep firing on existing actions', () => {
+  it('moveCard into the battlefield fires permanent-etb-yours, including a card triggering off its own entry', () => {
+    withScenarioStarted()
+    withHandCards(0, [card({ id: 'mulldrifter', name: 'Mulldrifter', cardType: 'creature', triggerTag: { event: 'permanent-etb-yours' } })])
+
+    useBuilderStore.getState().moveCard(0, 'mulldrifter', 'hand', 'battlefield')
+
+    const prompt = useBuilderStore.getState().pendingTriggerPrompt
+    expect(prompt?.triggers).toHaveLength(1)
+    expect(prompt?.triggers[0].sourceCard.name).toBe('Mulldrifter')
+  })
+
+  it('moveCard from battlefield to graveyard fires creature-dies only for creatures', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'artist', name: 'Blood Artist', cardType: 'creature', triggerTag: { event: 'creature-dies' } })])
+    withBattlefieldCards(0, [card({ id: 'bear', name: 'Bear', cardType: 'creature' })])
+
+    useBuilderStore.getState().moveCard(0, 'bear', 'battlefield', 'graveyard')
+
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers).toHaveLength(1)
+  })
+
+  it('moveCard from battlefield to graveyard does not fire creature-dies for a noncreature permanent', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'artist', name: 'Blood Artist', cardType: 'creature', triggerTag: { event: 'creature-dies' } })])
+    withBattlefieldCards(0, [card({ id: 'rock', name: 'Signet', cardType: 'artifact' })])
+
+    useBuilderStore.getState().moveCard(0, 'rock', 'battlefield', 'graveyard')
+
+    expect(useBuilderStore.getState().pendingTriggerPrompt).toBeNull()
+  })
+
+  it('resolveStack firing a creature onto the battlefield also fires permanent-etb-yours', () => {
+    withScenarioStarted()
+    withHandCards(0, [card({ id: 'mulldrifter', name: 'Mulldrifter', cardType: 'creature', triggerTag: { event: 'permanent-etb-yours' } })])
+    useBuilderStore.getState().castToStack(0, 'mulldrifter', 'hand', 'cast')
+    const stackItem = useBuilderStore.getState().stack[0]
+    useBuilderStore.setState({ pendingTriggerPrompt: null })
+
+    useBuilderStore.getState().resolveStack(stackItem.id)
+
+    expect(useBuilderStore.getState().pendingTriggerPrompt?.triggers).toHaveLength(1)
+  })
+
+  it('passTurn fires your-upkeep for the new active player', () => {
+    withScenarioStarted()
+    const players = useBuilderStore.getState().players!
+    const updated = [...players] as typeof players
+    updated[1] = { ...updated[1], zones: { ...updated[1].zones, battlefield: { cards: [card({ id: 'arena', name: 'Phyrexian Arena', cardType: 'enchantment', triggerTag: { event: 'your-upkeep' } })], revealed: true } } }
+    useBuilderStore.setState({ players: updated })
+
+    useBuilderStore.getState().passTurn()
+
+    const prompt = useBuilderStore.getState().pendingTriggerPrompt
+    expect(prompt?.triggers).toHaveLength(1)
+    expect(prompt?.triggers[0].sourceCard.name).toBe('Phyrexian Arena')
+  })
+})

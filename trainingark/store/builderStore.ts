@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Player, StackItem, Card } from '@/types/board'
+import type { Player, StackItem, Card, EventType, TriggerTag, TurnCounters } from '@/types/board'
 
 export type EditableZone = 'battlefield' | 'hand' | 'graveyard' | 'exile' | 'library' | 'command'
 
@@ -22,9 +22,24 @@ export interface ScenarioStep {
   boardState: {
     players: [Player, Player, Player, Player]
     stack: StackItem[]
+    turnCounters: TurnCounters
   }
   decisionPoint?: DecisionPoint
 }
+
+export interface PendingTrigger {
+  sourceCard: Card
+  controllerIndex: number
+  controller: string
+  event: EventType
+}
+
+export interface PendingTriggerPrompt {
+  event: EventType
+  triggers: PendingTrigger[]
+}
+
+export type TriggerStackOrder = 'first-listed-first' | 'last-listed-first'
 
 interface BuilderState {
   players: [Player, Player, Player, Player] | null
@@ -38,6 +53,9 @@ interface BuilderState {
   currentTurnPlayerIndex: number
   turnNumber: number
   handSizes: [number, number, number, number]
+  turnCounters: TurnCounters
+  pendingTriggerPrompt: PendingTriggerPrompt | null
+  triggerStackOrder: TriggerStackOrder | null
   steps: ScenarioStep[]
   lastSavedLogIndex: number
 
@@ -55,13 +73,17 @@ interface BuilderState {
   resolveStack: (itemId: string) => void
   removeFromStack: (itemId: string) => void
   exileFromStack: (itemId: string) => void
+  setStormCopyCount: (itemId: string, count: number) => void
   setLife: (playerIndex: number, life: number) => void
   setTax: (playerIndex: number, tax: number | [number, number]) => void
   setTaxPartner: (playerIndex: number, partnerIndex: 0 | 1, value: number) => void
   startScenario: () => void
   toggleTapped: (playerIndex: number, cardId: string) => void
   toggleRevealed: (playerIndex: number, cardId: string) => void
+  toggleDoesNotUntap: (playerIndex: number, cardId: string) => void
+  setTriggerTag: (playerIndex: number, cardId: string, triggerTag?: TriggerTag) => void
   drawCard: (playerIndex: number) => void
+  searchLibrary: (playerIndex: number) => void
   shuffleLibrary: (playerIndex: number) => void
   populateLibrary: (playerIndex: number, cards: Card[]) => void
   untapAll: (playerIndex: number) => void
@@ -70,6 +92,11 @@ interface BuilderState {
   setCurrentTurnPlayer: (index: number) => void
   setTurnNumber: (n: number) => void
   setHandSize: (playerIndex: number, size: number) => void
+  setSpellsCastThisTurn: (playerIndex: number, count: number) => void
+  setTotalSpellsCastThisTurn: (count: number) => void
+  setCardsDrawnThisTurn: (playerIndex: number, count: number) => void
+  acceptPendingTriggers: (order?: TriggerStackOrder) => void
+  dismissPendingTriggers: () => void
   saveStep: (label: string, decisionPoint?: DecisionPoint) => void
   deleteStep: (stepId: string) => void
   dismissDuplicateWarning: (cardId: string) => void
@@ -96,6 +123,7 @@ interface BuilderState {
         lastSavedLogIndex: number
         setupComplete: boolean[]
         scenarioStarted: boolean
+        turnCounters?: TurnCounters
       }
     }
   }) => void
@@ -112,6 +140,13 @@ type Snapshot = {
   players: [Player, Player, Player, Player]
   stack: StackItem[]
   logLines: string[]
+  turnCounters: TurnCounters
+}
+
+const EMPTY_TURN_COUNTERS: TurnCounters = {
+  spellsCastThisTurn: [0, 0, 0, 0],
+  totalSpellsCastThisTurn: 0,
+  cardsDrawnThisTurn: [0, 0, 0, 0],
 }
 
 const emptyZones = {
@@ -143,12 +178,13 @@ const PERMANENT_TYPES = new Set(['creature', 'artifact', 'enchantment', 'planesw
 
 let history: Snapshot[] = []
 
-function pushHistory(state: { players: [Player, Player, Player, Player] | null, stack: StackItem[], logLines: string[] }) {
+function pushHistory(state: { players: [Player, Player, Player, Player] | null, stack: StackItem[], logLines: string[], turnCounters: TurnCounters }) {
   if (!state.players) return
   history = [...history.slice(-19), {
     players: JSON.parse(JSON.stringify(state.players)),
     stack: JSON.parse(JSON.stringify(state.stack)),
     logLines: [...state.logLines],
+    turnCounters: JSON.parse(JSON.stringify(state.turnCounters)),
   }]
 }
 
@@ -169,6 +205,139 @@ export function makeUnknownCard(): Card {
 
 function isAbility(type: StackItem['type']): boolean {
   return type === 'triggered' || type === 'activated'
+}
+
+let stackSequence = 0
+
+function nextStackId(prefix = 'stack'): string {
+  stackSequence += 1
+  return `${prefix}-${Date.now()}-${stackSequence}`
+}
+
+function cloneCounters(counters: TurnCounters): TurnCounters {
+  return {
+    spellsCastThisTurn: [...counters.spellsCastThisTurn] as TurnCounters['spellsCastThisTurn'],
+    totalSpellsCastThisTurn: counters.totalSpellsCastThisTurn,
+    cardsDrawnThisTurn: [...counters.cardsDrawnThisTurn] as TurnCounters['cardsDrawnThisTurn'],
+  }
+}
+
+function triggerMatchesEvent(
+  tag: TriggerTag,
+  event: EventType,
+  sourcePlayerIndex: number,
+  eventPlayerIndex: number,
+  eventCard: Card | undefined,
+  counters: TurnCounters
+): boolean {
+  if (tag.event !== event) return false
+  if (tag.spellNumber !== undefined) {
+    // Ordinal tags (Esper Sentinel's "first spell", Lotho's "second spell",
+    // or a manually-tagged "second card drawn" effect) must be checked
+    // against the counter that actually matches the event's own kind.
+    const counterArray = event === 'opponent-draws' ? counters.cardsDrawnThisTurn : counters.spellsCastThisTurn
+    if (counterArray[eventPlayerIndex] !== tag.spellNumber) return false
+  }
+
+  switch (event) {
+    case 'opponent-casts':
+      return tag.controllerScope === 'any-player' || sourcePlayerIndex !== eventPlayerIndex
+    case 'opponent-casts-noncreature':
+      return sourcePlayerIndex !== eventPlayerIndex && eventCard?.cardType !== 'creature'
+    case 'you-cast-noncreature':
+      return sourcePlayerIndex === eventPlayerIndex && eventCard?.cardType !== 'creature'
+    case 'opponent-draws':
+    case 'opponent-searches':
+      return sourcePlayerIndex !== eventPlayerIndex
+    case 'permanent-etb-yours':
+    case 'your-upkeep':
+      return sourcePlayerIndex === eventPlayerIndex
+    case 'combat-damage-to-player':
+    case 'creature-dies':
+      return true
+  }
+}
+
+// A single game action can match several different tag categories at once
+// (e.g. casting a noncreature spell can simultaneously match a watcher
+// tagged opponent-casts AND one tagged opponent-casts-noncreature). Scanning
+// for every candidate event in one pass merges them into a single prompt,
+// with each trigger still labeled by its own matched event.
+function triggerPromptForEvents(
+  players: [Player, Player, Player, Player],
+  events: EventType[],
+  eventPlayerIndex: number,
+  counters: TurnCounters,
+  eventCard?: Card,
+  additionalSource?: PendingTrigger
+): PendingTriggerPrompt | null {
+  const triggers: PendingTrigger[] = []
+  const seenCardIds = new Set<string>()
+
+  const sourceTag = additionalSource?.sourceCard.triggerTag
+  if (sourceTag && events.includes(sourceTag.event)
+    && triggerMatchesEvent(sourceTag, sourceTag.event, additionalSource!.controllerIndex, eventPlayerIndex, eventCard, counters)) {
+    triggers.push(additionalSource!)
+    seenCardIds.add(additionalSource!.sourceCard.id)
+  }
+
+  players.forEach((player, playerIndex) => {
+    player.zones.battlefield.cards.forEach(card => {
+      const tag = card.triggerTag
+      if (!tag || seenCardIds.has(card.id) || !events.includes(tag.event)) return
+      if (!triggerMatchesEvent(tag, tag.event, playerIndex, eventPlayerIndex, eventCard, counters)) return
+      triggers.push({ sourceCard: { ...card }, controllerIndex: playerIndex, controller: player.name, event: tag.event })
+      seenCardIds.add(card.id)
+    })
+  })
+
+  // `event` is a fallback label only when merging multiple event kinds —
+  // each individual trigger carries its own accurate event for display.
+  return triggers.length > 0 ? { event: events[0], triggers } : null
+}
+
+function triggerPromptForEvent(
+  players: [Player, Player, Player, Player],
+  event: EventType,
+  eventPlayerIndex: number,
+  counters: TurnCounters,
+  eventCard?: Card,
+  additionalSource?: PendingTrigger
+): PendingTriggerPrompt | null {
+  return triggerPromptForEvents(players, [event], eventPlayerIndex, counters, eventCard, additionalSource)
+}
+
+// pendingTriggerPrompt is a single slot. If a second action fires before the
+// first prompt is accepted/dismissed, merge rather than overwrite — a busy
+// storm turn can easily produce several triggering actions in quick
+// succession, and silently dropping one would be worse than no automation.
+function mergeTriggerPrompt(existing: PendingTriggerPrompt | null, incoming: PendingTriggerPrompt | null): PendingTriggerPrompt | null {
+  if (!incoming) return existing
+  if (!existing) return incoming
+  const seen = new Set(existing.triggers.map(t => t.sourceCard.id))
+  const merged = [...existing.triggers, ...incoming.triggers.filter(t => !seen.has(t.sourceCard.id))]
+  return { event: existing.event, triggers: merged }
+}
+
+function cardHasStorm(card: Card, player: Player): boolean {
+  if (card.hasStorm) return true
+  return player.zones.battlefield.cards.some(permanent =>
+    permanent.grantsStorm?.toTypes.includes(card.cardType)
+  )
+}
+
+function makeStackItem(card: Card, controller: string, type: StackItem['type']): StackItem {
+  return {
+    id: nextStackId(),
+    sourceCardId: card.id,
+    sourceCardName: card.name,
+    controller,
+    label: card.name,
+    type,
+    imageUrl: card.imageUrl,
+    cardType: card.cardType,
+    sourceCard: { ...card, tapped: false },
+  }
 }
 
 // Rebuilds the card for zone placement after stack resolution. Prefers the
@@ -239,6 +408,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
   currentTurnPlayerIndex: 0,
   turnNumber: 1,
   handSizes: [7, 7, 7, 7],
+  turnCounters: cloneCounters(EMPTY_TURN_COUNTERS),
+  pendingTriggerPrompt: null,
+  triggerStackOrder: null,
   steps: [],
   lastSavedLogIndex: 0,
   scenarioTitle: 'Untitled Scenario',
@@ -278,6 +450,43 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     set({ handSizes: current })
   },
 
+  setSpellsCastThisTurn: (playerIndex, count) => {
+    const turnCounters = cloneCounters(get().turnCounters)
+    turnCounters.spellsCastThisTurn[playerIndex] = Math.max(0, count)
+    set({ turnCounters })
+  },
+
+  setTotalSpellsCastThisTurn: (count) => {
+    set(state => ({
+      turnCounters: { ...state.turnCounters, totalSpellsCastThisTurn: Math.max(0, count) },
+    }))
+  },
+
+  setCardsDrawnThisTurn: (playerIndex, count) => {
+    const turnCounters = cloneCounters(get().turnCounters)
+    turnCounters.cardsDrawnThisTurn[playerIndex] = Math.max(0, count)
+    set({ turnCounters })
+  },
+
+  acceptPendingTriggers: (order) => {
+    const state = get()
+    const prompt = state.pendingTriggerPrompt
+    if (!prompt) return
+    const chosenOrder = order ?? state.triggerStackOrder ?? 'first-listed-first'
+    const triggerItems = prompt.triggers.map(trigger => makeStackItem(trigger.sourceCard, trigger.controller, 'triggered'))
+    const orderedItems = chosenOrder === 'first-listed-first' ? [...triggerItems].reverse() : triggerItems
+    set({
+      stack: [...state.stack, ...orderedItems],
+      pendingTriggerPrompt: null,
+      ...(prompt.triggers.length > 1 && !state.triggerStackOrder && { triggerStackOrder: chosenOrder }),
+      logLines: state.scenarioStarted
+        ? [...state.logLines, ...prompt.triggers.map(trigger => `${trigger.controller}'s ${trigger.sourceCard.name} triggers.`)]
+        : state.logLines,
+    })
+  },
+
+  dismissPendingTriggers: () => set({ pendingTriggerPrompt: null }),
+
   saveStep: (label, decisionPoint) => {
     const state = get()
     if (!state.players) return
@@ -288,6 +497,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       boardState: {
         players: JSON.parse(JSON.stringify(state.players)),
         stack: JSON.parse(JSON.stringify(state.stack)),
+        turnCounters: cloneCounters(state.turnCounters),
       },
       ...(decisionPoint && { decisionPoint }),
     }
@@ -325,6 +535,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
         lastSavedLogIndex: ws.lastSavedLogIndex,
         setupComplete: [...ws.setupComplete],
         scenarioStarted: ws.scenarioStarted,
+        turnCounters: cloneCounters(ws.turnCounters ?? EMPTY_TURN_COUNTERS),
+        pendingTriggerPrompt: null,
+        triggerStackOrder: null,
       })
       return
     }
@@ -347,6 +560,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       lastSavedLogIndex: 0,
       setupComplete: [true, true, true, true],
       scenarioStarted: true,
+      turnCounters: cloneCounters(lastStep.boardState.turnCounters ?? EMPTY_TURN_COUNTERS),
+      pendingTriggerPrompt: null,
+      triggerStackOrder: null,
     })
   },
 
@@ -366,6 +582,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       currentTurnPlayerIndex: 0,
       turnNumber: 1,
       handSizes: [7, 7, 7, 7],
+      turnCounters: cloneCounters(EMPTY_TURN_COUNTERS),
+      pendingTriggerPrompt: null,
+      triggerStackOrder: null,
       steps: [],
       lastSavedLogIndex: 0,
       scenarioTitle: 'Untitled Scenario',
@@ -456,6 +675,60 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     })
   },
 
+  toggleDoesNotUntap: (playerIndex, cardId) => {
+    const state = get()
+    if (!state.players) return
+    const player = state.players[playerIndex]
+    const cardIndex = player.zones.battlefield.cards.findIndex(card => card.id === cardId)
+    if (cardIndex === -1) return
+    pushHistory(state)
+    const cards = [...player.zones.battlefield.cards]
+    const card = cards[cardIndex]
+    const doesNotUntap = !card.doesNotUntap
+    cards[cardIndex] = { ...card, doesNotUntap }
+    const updated = [...state.players] as [Player, Player, Player, Player]
+    updated[playerIndex] = {
+      ...player,
+      zones: { ...player.zones, battlefield: { ...player.zones.battlefield, cards } },
+    }
+    set({
+      players: updated,
+      logLines: state.scenarioStarted
+        ? [...state.logLines, `${player.name}'s ${card.name} ${doesNotUntap ? 'is marked does not untap' : 'can untap normally'}.`]
+        : state.logLines,
+    })
+  },
+
+  setTriggerTag: (playerIndex, cardId, triggerTag) => {
+    const state = get()
+    if (!state.players) return
+    const player = state.players[playerIndex]
+    const zones = { ...player.zones }
+    let cardName = ''
+    let found = false
+    for (const zoneName of Object.keys(zones) as EditableZone[]) {
+      const zone = zones[zoneName]
+      const cardIndex = zone.cards.findIndex(card => card.id === cardId)
+      if (cardIndex === -1) continue
+      pushHistory(state)
+      const cards = [...zone.cards]
+      cardName = cards[cardIndex].name
+      cards[cardIndex] = { ...cards[cardIndex], ...(triggerTag ? { triggerTag } : { triggerTag: undefined }) }
+      zones[zoneName] = { ...zone, cards }
+      found = true
+      break
+    }
+    if (!found) return
+    const updated = [...state.players] as [Player, Player, Player, Player]
+    updated[playerIndex] = { ...player, zones }
+    set({
+      players: updated,
+      logLines: state.scenarioStarted
+        ? [...state.logLines, `${player.name}'s ${cardName} trigger tag is ${triggerTag ? 'set' : 'cleared'}.`]
+        : state.logLines,
+    })
+  },
+
   untapAll: (playerIndex) => {
     const state = get()
     if (!state.players) return
@@ -499,10 +772,17 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     }
     newLogLines.push(`Turn ${newTurnNumber} — ${nextPlayer.name} untaps all permanents.`)
 
+    // Spells-cast and cards-drawn counters are whole-turn counters, not
+    // per-player-rotated — a new turn zeroes them for everyone.
+    const newCounters = cloneCounters(EMPTY_TURN_COUNTERS)
+    const prompt = state.scenarioStarted ? triggerPromptForEvent(updated, 'your-upkeep', nextIdx, newCounters) : null
+
     set({
       players: updated,
       currentTurnPlayerIndex: nextIdx,
       turnNumber: newTurnNumber,
+      turnCounters: newCounters,
+      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? newLogLines : state.logLines,
     })
   },
@@ -542,7 +822,21 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
     const positionLabel = toZone === 'library' ? (position === 'bottom' ? 'bottom of library' : 'top of library') : ZONE_NAMES[toZone]
     const logLine = `${card.name} moves from ${player.name}'s ${ZONE_NAMES[fromZone]} to ${positionLabel}.`
-    set({ players: updated, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+
+    let prompt: PendingTriggerPrompt | null = null
+    if (state.scenarioStarted) {
+      if (toZone === 'battlefield') {
+        prompt = triggerPromptForEvent(updated, 'permanent-etb-yours', playerIndex, state.turnCounters)
+      } else if (fromZone === 'battlefield' && toZone === 'graveyard' && card.cardType === 'creature') {
+        prompt = triggerPromptForEvent(updated, 'creature-dies', playerIndex, state.turnCounters)
+      }
+    }
+
+    set({
+      players: updated,
+      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
+      logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
+    })
   },
 
   moveAllCards: (playerIndex, fromZone, toZone, position = 'top') => {
@@ -800,23 +1094,47 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       }
     }
 
-    const stackItem: StackItem = {
-	  id: `stack-${Date.now()}`,
-	  sourceCardId: card.id,
-	  sourceCardName: card.name,
-	  controller: player.name,
-	  label: card.name,
-	  type,
-	  imageUrl: card.imageUrl,
-	  cardType: card.cardType,
-	  sourceCard: { ...card, tapped: false },
+    const stackItem = makeStackItem(card, player.name, type)
+    const newStack = [...state.stack, stackItem]
+    const typeLabel = type === 'cast' ? 'casts' : type === 'triggered' ? 'triggers' : 'activates'
+    const newLogLines = state.scenarioStarted ? [...state.logLines, `${player.name} ${typeLabel} ${card.name}.`] : state.logLines
+
+    // Counters, storm, and reactive trigger prompts only apply to a real
+    // cast, and only during play — setup is board construction, not an
+    // in-game event, so nothing should fire or increment there.
+    if (type !== 'cast' || !state.scenarioStarted) {
+      set({ players: updated, stack: newStack, logLines: newLogLines })
+      return
     }
 
-    const typeLabel = type === 'cast' ? 'casts' : type === 'triggered' ? 'triggers' : 'activates'
+    // Storm copies the spells cast BEFORE this one (CR 702.41a), excluding
+    // itself — so the count must be captured before incrementing.
+    const priorSpellCount = state.turnCounters.spellsCastThisTurn[playerIndex]
+    const newCounters = cloneCounters(state.turnCounters)
+    newCounters.spellsCastThisTurn[playerIndex] += 1
+    newCounters.totalSpellsCastThisTurn += 1
+
+    let finalStack = newStack
+    let finalLogLines = newLogLines
+    if (cardHasStorm(card, player)) {
+      // Storm is deterministic from Scryfall's keyword/grant data, so it is
+      // pushed automatically rather than going through the accept/dismiss
+      // prompt used for ambiguous oracle-text-regex tags.
+      const stormItem = { ...makeStackItem(card, player.name, 'triggered'), stormCopyCount: priorSpellCount }
+      finalStack = [...finalStack, stormItem]
+      finalLogLines = [...finalLogLines, `${card.name}'s storm triggers (copies locked at ${priorSpellCount}).`]
+    }
+
+    const prompt = triggerPromptForEvents(
+      updated, ['opponent-casts', 'opponent-casts-noncreature', 'you-cast-noncreature'], playerIndex, newCounters, card
+    )
+
     set({
       players: updated,
-      stack: [...state.stack, stackItem],
-      logLines: state.scenarioStarted ? [...state.logLines, `${player.name} ${typeLabel} ${card.name}.`] : state.logLines,
+      stack: finalStack,
+      turnCounters: newCounters,
+      pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
+      logLines: finalLogLines,
     })
   },
 
@@ -826,6 +1144,34 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     pushHistory(state)
     const item = state.stack.find(s => s.id === itemId)
     if (!item) return
+
+    if (item.stormCopyCount !== undefined) {
+      // The storm trigger itself resolving: fan out into N separate stack
+      // items (not one grouped item) so the stack display still shows
+      // individual resolution order.
+      const original = cardFromStackItem(item)
+      const copyCount = item.stormCopyCount
+      const copies = Array.from({ length: copyCount }, () => ({
+        ...makeStackItem(original, item.controller, 'cast'),
+        isStormCopy: true,
+      }))
+      set({
+        stack: [...state.stack.filter(s => s.id !== itemId), ...copies],
+        logLines: state.scenarioStarted
+          ? [...state.logLines, `${item.sourceCardName}'s storm trigger creates ${copyCount} ${copyCount === 1 ? 'copy' : 'copies'}.`]
+          : state.logLines,
+      })
+      return
+    }
+
+    if (item.isStormCopy) {
+      // A copy ceases to exist on resolution rather than landing in a zone.
+      set({
+        stack: state.stack.filter(s => s.id !== itemId),
+        logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s storm copy ceases to exist.`] : state.logLines,
+      })
+      return
+    }
 
     if (isAbility(item.type)) {
       set({
@@ -842,9 +1188,15 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       ? `${item.sourceCardName} resolves onto the battlefield.`
       : `${item.sourceCardName} resolves and is put into the graveyard.`
 
+    const controllerIndex = updated.findIndex(p => p.name === item.controller)
+    const prompt = (isPermanent && state.scenarioStarted && controllerIndex !== -1)
+      ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters)
+      : null
+
     set({
       players: updated,
       stack: state.stack.filter(s => s.id !== itemId),
+      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
     })
   },
@@ -855,6 +1207,14 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     pushHistory(state)
     const item = state.stack.find(s => s.id === itemId)
     if (!item) return
+
+    if (item.isStormCopy) {
+      set({
+        stack: state.stack.filter(s => s.id !== itemId),
+        logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s storm copy is countered and ceases to exist.`] : state.logLines,
+      })
+      return
+    }
 
     if (isAbility(item.type)) {
       set({
@@ -879,6 +1239,14 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     const item = state.stack.find(s => s.id === itemId)
     if (!item) return
 
+    if (item.isStormCopy) {
+      set({
+        stack: state.stack.filter(s => s.id !== itemId),
+        logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s storm copy is exiled and ceases to exist.`] : state.logLines,
+      })
+      return
+    }
+
     if (isAbility(item.type)) {
       set({
         stack: state.stack.filter(s => s.id !== itemId),
@@ -893,6 +1261,11 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       stack: state.stack.filter(s => s.id !== itemId),
       logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName} is exiled.`] : state.logLines,
     })
+  },
+
+  setStormCopyCount: (itemId, count) => {
+    const stack = get().stack.map(item => item.id === itemId ? { ...item, stormCopyCount: Math.max(0, count) } : item)
+    set({ stack })
   },
 
   setLife: (playerIndex, life) => {
@@ -959,9 +1332,40 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
         hand: { ...player.zones.hand, cards: [...player.zones.hand.cards, drawnCard], cardCount: handCount + 1 },
       },
     }
+
+    if (!state.scenarioStarted) {
+      set({ players: updated })
+      return
+    }
+
+    const newCounters = cloneCounters(state.turnCounters)
+    newCounters.cardsDrawnThisTurn[playerIndex] += 1
+    // Known limitation: this fires on every draw, including the ordinary
+    // turn-based draw — there is no separate drawForTurn action, so a card
+    // like Orcish Bowmasters ("except the first one they draw in each of
+    // their draw steps") will over-trigger here. The author dismisses the
+    // extra prompt; see lib/triggerDetection.ts for the matching note.
+    const prompt = triggerPromptForEvent(updated, 'opponent-draws', playerIndex, newCounters)
+
     set({
       players: updated,
-      logLines: state.scenarioStarted ? [...state.logLines, `${player.name} draws a card.`] : state.logLines,
+      turnCounters: newCounters,
+      pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
+      logLines: [...state.logLines, `${player.name} draws a card.`],
+    })
+  },
+
+  searchLibrary: (playerIndex) => {
+    const state = get()
+    if (!state.players) return
+    pushHistory(state)
+    const player = state.players[playerIndex]
+    const prompt = state.scenarioStarted
+      ? triggerPromptForEvent(state.players, 'opponent-searches', playerIndex, state.turnCounters)
+      : null
+    set({
+      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
+      logLines: state.scenarioStarted ? [...state.logLines, `${player.name} searches their library.`] : state.logLines,
     })
   },
 
@@ -1020,6 +1424,13 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     if (history.length === 0) return
     const snapshot = history[history.length - 1]
     history = history.slice(0, -1)
-    set({ players: snapshot.players, stack: snapshot.stack, logLines: snapshot.logLines })
+    set({
+      players: snapshot.players,
+      stack: snapshot.stack,
+      logLines: snapshot.logLines,
+      turnCounters: snapshot.turnCounters,
+      // A prompt born from the action being undone is now stale.
+      pendingTriggerPrompt: null,
+    })
   },
 }))

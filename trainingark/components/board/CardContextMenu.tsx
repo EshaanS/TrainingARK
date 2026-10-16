@@ -1,10 +1,11 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import styles from './CardContextMenu.module.css'
 import type { EditableZone } from '@/store/builderStore'
-import type { Card } from '@/types/board'
+import type { Card, TriggerTag } from '@/types/board'
+import { EVENT_TYPE_LABELS } from '@/lib/triggerDetection'
 
 export type ZoneTarget =
   | 'battlefield'
@@ -25,12 +26,16 @@ interface CardContextMenuProps {
   isCommander?: boolean
   isTapped?: boolean
   isRevealed?: boolean
+  isDoesNotUntap?: boolean
+  triggerTag?: TriggerTag
   onMove: (target: ZoneTarget) => void
   onCastToStack: (type: StackType) => void
   onToggleTapped?: () => void
   // Only supplied for opponent seats — the player's own cards are always
   // visible to the viewer, so there is nothing to reveal.
   onToggleRevealed?: () => void
+  onToggleDoesNotUntap?: () => void
+  onSetTriggerTag?: (tag?: TriggerTag) => void
   onRemove: () => void
   onCreateTokenCopy?: () => void
   onClose: () => void
@@ -38,10 +43,17 @@ interface CardContextMenuProps {
 }
 
 export function CardContextMenu({
-  x, y, cardName, cardType, isCommander, isTapped, isRevealed,
-  onMove, onCastToStack, onToggleTapped, onToggleRevealed, onRemove, onCreateTokenCopy, onClose, currentZone,
+  x, y, cardName, cardType, isCommander, isTapped, isRevealed, isDoesNotUntap, triggerTag,
+  onMove, onCastToStack, onToggleTapped, onToggleRevealed, onToggleDoesNotUntap, onSetTriggerTag,
+  onRemove, onCreateTokenCopy, onClose, currentZone,
 }: CardContextMenuProps) {
   const ref = useRef<HTMLDivElement>(null)
+  // Trigger-tag selection is a second view inside this same menu/portal
+  // rather than a nested ZoneMenu — both are independently portaled with
+  // their own click-outside listeners, so a nested menu's own item click
+  // would register as "outside" this menu and unmount both before the
+  // inner handler fires.
+  const [view, setView] = useState<'main' | 'triggerTag'>('main')
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -66,6 +78,30 @@ export function CardContextMenu({
   const isLand = cardType === 'land'
   const onBattlefield = currentZone === 'battlefield'
 
+  const triggerTagView = (
+    <div ref={ref} className={styles.menu} style={{ left: adjustedX, top: adjustedY }}>
+      <div className={styles.menuHeader}>{cardName} — Trigger Tag</div>
+      <div className={styles.menuDivider} />
+      <button className={styles.menuItem} onClick={() => setView('main')}>
+        ← Back
+      </button>
+      <div className={styles.menuDivider} />
+      {(Object.entries(EVENT_TYPE_LABELS) as [TriggerTag['event'], string][]).map(([event, label]) => (
+        <button key={event} className={styles.menuItem} onClick={() => { onSetTriggerTag?.({ event }); onClose() }}>
+          {label}
+        </button>
+      ))}
+      {triggerTag && (
+        <>
+          <div className={styles.menuDivider} />
+          <button className={`${styles.menuItem} ${styles.menuItemDanger}`} onClick={() => { onSetTriggerTag?.(undefined); onClose() }}>
+            Clear Trigger Tag
+          </button>
+        </>
+      )}
+    </div>
+  )
+
   const menu = (
     <div ref={ref} className={styles.menu} style={{ left: adjustedX, top: adjustedY }}>
       <div className={styles.menuHeader}>{cardName}</div>
@@ -75,6 +111,15 @@ export function CardContextMenu({
         <>
           <button className={styles.menuItem} onClick={() => { onToggleTapped(); onClose() }}>
             {isTapped ? 'Untap' : 'Tap'} <span className={styles.kbd}>T</span>
+          </button>
+          <div className={styles.menuDivider} />
+        </>
+      )}
+
+      {onBattlefield && onToggleDoesNotUntap && (
+        <>
+          <button className={styles.menuItem} onClick={() => { onToggleDoesNotUntap(); onClose() }}>
+            {isDoesNotUntap ? 'Allow Untap' : 'Mark Does Not Untap'}
           </button>
           <div className={styles.menuDivider} />
         </>
@@ -139,6 +184,11 @@ export function CardContextMenu({
           <button className={styles.menuItem} onClick={() => { onCastToStack('activated'); onClose() }}>
             Add Activated Ability
           </button>
+          {onSetTriggerTag && (
+            <button className={styles.menuItem} onClick={() => setView('triggerTag')}>
+              Set Trigger Tag{triggerTag ? ` (${EVENT_TYPE_LABELS[triggerTag.event]})` : '...'}
+            </button>
+          )}
         </>
       )}
 
@@ -158,5 +208,5 @@ export function CardContextMenu({
     </div>
   )
 
-  return createPortal(menu, document.body)
+  return createPortal(view === 'triggerTag' ? triggerTagView : menu, document.body)
 }

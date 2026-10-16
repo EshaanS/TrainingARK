@@ -56,7 +56,7 @@ export function BuilderHeader({ initialScenarioId }: { initialScenarioId?: strin
     players, steps, decklists,
     firstPlayerIndex, currentTurnPlayerIndex, turnNumber, handSizes,
     loadScenario, resetScenario,
-    stack, logLines, lastSavedLogIndex, setupComplete, scenarioStarted,
+    stack, logLines, lastSavedLogIndex, setupComplete, scenarioStarted, turnCounters,
   } = useBuilderStore()
 
   const router = useRouter()
@@ -137,6 +137,7 @@ export function BuilderHeader({ initialScenarioId }: { initialScenarioId?: strin
           lastSavedLogIndex,
           setupComplete,
           scenarioStarted,
+          turnCounters,
         },
       },
     }
