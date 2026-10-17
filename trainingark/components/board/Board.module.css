@@ -49,6 +49,7 @@
 
 .stackItem {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 5px;
     padding: 3px 0;
@@ -79,6 +80,14 @@
     color: rgba(232, 224, 212, 0.35);
     font-size: 0.6rem;
     flex-shrink: 0;
+}
+
+.stackAlert {
+    flex-basis: 100%;
+    color: #e8c96a;
+    font-size: 0.6rem;
+    line-height: 1.35;
+    padding-left: 14px;
 }
 
 .stackActions {

@@ -11,23 +11,43 @@ export type CardType =
 export type EventType =
   | 'opponent-casts'
   | 'opponent-casts-noncreature'
+  | 'any-player-casts'
   | 'you-cast-noncreature'
   | 'opponent-draws'
+  | 'any-player-draws'
   | 'permanent-etb-yours'
   | 'opponent-searches'
   | 'your-upkeep'
   | 'combat-damage-to-player'
   | 'creature-dies'
 
+// What a trigger does when it resolves, for the few effects the builder does
+// bookkeeping for. Anything else has no effect and resolving it is a no-op.
+// Library searches are not an effect kind: Card.searchesLibrary already
+// carries that fact.
+export type TriggerEffect =
+  | { kind: 'draw', count: number }
+  | { kind: 'createToken', count: number, tokenName: string }
+
 export interface TriggerTag {
   event: EventType
+  // any-player-casts carries its noncreature restriction here; the
+  // opponent-scoped cast events encode it in the event type instead.
   qualifier?: 'noncreature'
   // Some triggered abilities contain a simple ordinal condition. This is a
   // suggestion gate only: authors can always add the ability manually.
   // Despite the name, for opponent-draws it is the nth card drawn this turn.
   // Kept as-is because tags are persisted inside saved scenario snapshots.
   spellNumber?: number
-  controllerScope?: 'opponents' | 'any-player'
+  effect?: TriggerEffect
+}
+
+// A replacement effect (Alhammarret's Archive, Notion Thief, Anointed
+// Procession) that changes how a draw or token effect actually plays out.
+// Only used to warn the author — the builder never applies it.
+export interface CountReplacement {
+  kind: TriggerEffect['kind']
+  affects: 'controller' | 'opponents'
 }
 
 export interface TurnCounters {
@@ -58,6 +78,7 @@ export interface Card {
   // Casting or activating this card searches its controller's library, which
   // offers opponent-searches triggers (Archivist of Oghma).
   searchesLibrary?: boolean
+  countReplacements?: CountReplacement[]
   doesNotUntap?: boolean
 }
 

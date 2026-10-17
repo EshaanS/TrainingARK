@@ -430,6 +430,14 @@
   flex-shrink: 0;
 }
 
+.searchAlert {
+  margin: 0;
+  flex-shrink: 0;
+  color: #e8c96a;
+  font-size: 0.62rem;
+  line-height: 1.35;
+}
+
 .closeExpanded {
   background: none;
   border: none;

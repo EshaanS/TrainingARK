@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import type { Player, StackItem, Card, EventType, TriggerTag, TurnCounters } from '@/types/board'
+import type { Player, StackItem, Card, EventType, TriggerEffect, TriggerTag, TurnCounters } from '@/types/board'
+import { fetchTokenCard } from '@/lib/scryfallCard'
 
 export type EditableZone = 'battlefield' | 'hand' | 'graveyard' | 'exile' | 'library' | 'command'
 
@@ -41,6 +42,14 @@ export interface PendingTriggerPrompt {
 
 export type TriggerStackOrder = 'first-listed-first' | 'last-listed-first'
 
+// Set when a library search resolves, so that player's zone opens its
+// library view. requestId distinguishes back-to-back searches by one player.
+export interface LibrarySearch {
+  playerIndex: number
+  requestId: number
+  alerts: string[]
+}
+
 interface BuilderState {
   players: [Player, Player, Player, Player] | null
   stack: StackItem[]
@@ -55,6 +64,7 @@ interface BuilderState {
   handSizes: [number, number, number, number]
   turnCounters: TurnCounters
   pendingTriggerPrompt: PendingTriggerPrompt | null
+  librarySearch: LibrarySearch | null
   triggerStackOrder: TriggerStackOrder | null
   steps: ScenarioStep[]
   lastSavedLogIndex: number
@@ -96,6 +106,7 @@ interface BuilderState {
   setCardsDrawnThisTurn: (playerIndex: number, count: number) => void
   acceptPendingTriggers: (order?: TriggerStackOrder) => void
   dismissPendingTriggers: () => void
+  closeLibrarySearch: () => void
   saveStep: (label: string, decisionPoint?: DecisionPoint) => void
   deleteStep: (stepId: string) => void
   dismissDuplicateWarning: (cardId: string) => void
@@ -176,9 +187,13 @@ const ZONE_NAMES: Record<EditableZone, string> = {
 const PERMANENT_TYPES = new Set(['creature', 'artifact', 'enchantment', 'planeswalker', 'land', 'battle'])
 
 let history: Snapshot[] = []
+// While a resolving trigger replays existing actions (drawCard, addCard) for
+// its effect, those actions must not push their own snapshots — one undo
+// should take back the whole resolution, not just its last draw.
+let historySuppressed = false
 
 function pushHistory(state: { players: [Player, Player, Player, Player] | null, stack: StackItem[], logLines: string[], turnCounters: TurnCounters }) {
-  if (!state.players) return
+  if (!state.players || historySuppressed) return
   history = [...history.slice(-19), {
     players: JSON.parse(JSON.stringify(state.players)),
     stack: JSON.parse(JSON.stringify(state.stack)),
@@ -234,17 +249,22 @@ function triggerMatchesEvent(
     // Ordinal tags (Esper Sentinel's "first spell", Lotho's "second spell",
     // or a manually-tagged "second card drawn" effect) must be checked
     // against the counter that actually matches the event's own kind.
-    const counterArray = event === 'opponent-draws' ? counters.cardsDrawnThisTurn : counters.spellsCastThisTurn
+    const counterArray = event === 'opponent-draws' || event === 'any-player-draws'
+      ? counters.cardsDrawnThisTurn
+      : counters.spellsCastThisTurn
     if (counterArray[eventPlayerIndex] !== tag.spellNumber) return false
   }
 
   switch (event) {
-    case 'opponent-casts':
-      return tag.controllerScope === 'any-player' || sourcePlayerIndex !== eventPlayerIndex
+    case 'any-player-casts':
+      return tag.qualifier !== 'noncreature' || eventCard?.cardType !== 'creature'
+    case 'any-player-draws':
+      return true
     case 'opponent-casts-noncreature':
       return sourcePlayerIndex !== eventPlayerIndex && eventCard?.cardType !== 'creature'
     case 'you-cast-noncreature':
       return sourcePlayerIndex === eventPlayerIndex && eventCard?.cardType !== 'creature'
+    case 'opponent-casts':
     case 'opponent-draws':
     case 'opponent-searches':
       return sourcePlayerIndex !== eventPlayerIndex
@@ -352,21 +372,177 @@ function cardFromStackItem(item: StackItem): Card {
 }
 
 // A search happens while the searching object resolves, so opponent-searches
-// is offered here rather than at cast/activation — otherwise an accepted
-// Archivist of Oghma trigger would sit above the tutor and resolve first.
-// Callers only pass objects that perform the search themselves: instants,
-// sorceries, their storm copies, and abilities (fetch land activations,
-// "when this enters, search" triggers). A permanent spell resolving does not
-// search; its ETB trigger does, when that trigger resolves.
-function searchPromptOnResolve(
-  players: [Player, Player, Player, Player],
-  item: StackItem,
-  counters: TurnCounters
-): PendingTriggerPrompt | null {
-  if (!item.sourceCard?.searchesLibrary) return null
+// is offered (and the library view opened) at resolution rather than at
+// cast/activation — otherwise an accepted Archivist of Oghma trigger would sit
+// above the tutor and resolve first. Only objects that perform the search
+// themselves count: instants, sorceries, their storm copies, and abilities
+// (fetch land activations, "when this enters, search" triggers). A permanent
+// spell resolving does not search; its ETB trigger does, when that resolves.
+function searchesOnResolve(item: StackItem): boolean {
+  if (!item.sourceCard?.searchesLibrary || item.stormCopyCount !== undefined) return false
+  if (item.isStormCopy || isAbility(item.type)) return true
+  return !(item.cardType && PERMANENT_TYPES.has(item.cardType))
+}
+
+// Only a resolving triggered ability carries out its parsed effect — the
+// author clicking resolve is the decision (e.g. Rhystic Study's opponent did
+// not pay). A storm trigger is a triggered item too, but creates copies.
+function resolutionEffect(item: StackItem): TriggerEffect | undefined {
+  if (item.type !== 'triggered' || item.stormCopyCount !== undefined) return undefined
+  return item.sourceCard?.triggerTag?.effect
+}
+
+// Notes for the author about permanents that change what a resolving effect
+// really does. They never change behavior: the effect still fires exactly as
+// parsed, and the author corrects the board by hand.
+export function resolutionAlerts(players: [Player, Player, Player, Player], item: StackItem): string[] {
   const controllerIndex = players.findIndex(p => p.name === item.controller)
-  if (controllerIndex === -1) return null
-  return triggerPromptForEvent(players, 'opponent-searches', controllerIndex, counters, item.sourceCard)
+  if (controllerIndex === -1) return []
+  return [...effectAlerts(players, item, controllerIndex), ...searchAlerts(players, item, controllerIndex)]
+}
+
+function effectAlerts(players: [Player, Player, Player, Player], item: StackItem, controllerIndex: number): string[] {
+  const effect = resolutionEffect(item)
+  if (!effect) return []
+  const alerts: string[] = []
+  players.forEach((player, playerIndex) => {
+    player.zones.battlefield.cards.forEach(card => {
+      const applies = card.countReplacements?.some(r =>
+        r.kind === effect.kind && (r.affects === 'controller') === (playerIndex === controllerIndex)
+      )
+      if (!applies) return
+      alerts.push(effect.kind === 'draw'
+        ? `${card.name} (${player.name}) changes draws — this draws ${effect.count} as printed; adjust by hand.`
+        : `${card.name} (${player.name}) changes token creation — this creates ${effect.count} ${effect.tokenName} as printed; adjust by hand.`)
+    })
+  })
+  return alerts
+}
+
+// Opposition Agent is matched by name: no general pattern for "takes control
+// of searches" is worth building for one card, and modelling any part of its
+// effect would look handled while being wrong.
+function searchAlerts(players: [Player, Player, Player, Player], item: StackItem, controllerIndex: number): string[] {
+  if (!searchesOnResolve(item)) return []
+  const searcher = players[controllerIndex].name
+  return players.flatMap((player, playerIndex) => {
+    if (playerIndex === controllerIndex) return []
+    if (!player.zones.battlefield.cards.some(card => card.name === 'Opposition Agent')) return []
+    return [
+      `Opposition Agent (${player.name}): ${player.name} controls ${searcher} during this search, seeing their library and hand. ` +
+      `Cards found are exiled and ${player.name} may play them — ${searcher} gets nothing. Set this up by hand.`,
+    ]
+  })
+}
+
+// Runs once the item has left the stack, against the updated board. Effects
+// replay the existing drawCard/addCard actions so their logging, counters,
+// token stacking, and opponent-draws prompts all apply as usual.
+function applyResolution(
+  item: StackItem,
+  get: () => BuilderState,
+  set: (partial: Partial<BuilderState>) => void
+) {
+  const state = get()
+  if (!state.scenarioStarted || !state.players) return
+  const controllerIndex = state.players.findIndex(p => p.name === item.controller)
+  if (controllerIndex === -1) return
+
+  const effect = resolutionEffect(item)
+  if (effect) {
+    historySuppressed = true
+    try {
+      for (let i = 0; i < effect.count; i++) {
+        if (effect.kind === 'draw') get().drawCard(controllerIndex)
+        else get().addCard(controllerIndex, 'battlefield', makeEffectToken(get().players!, effect.tokenName))
+      }
+    } finally {
+      historySuppressed = false
+    }
+    if (effect.kind === 'createToken') fillMissingTokenArt(effect.tokenName, get, set)
+  }
+
+  if (searchesOnResolve(item)) {
+    const current = get()
+    const prompt = triggerPromptForEvent(current.players!, 'opponent-searches', controllerIndex, current.turnCounters, item.sourceCard)
+    set({
+      pendingTriggerPrompt: mergeTriggerPrompt(current.pendingTriggerPrompt, prompt),
+      librarySearch: {
+        playerIndex: controllerIndex,
+        requestId: ++librarySearchSeq,
+        alerts: searchAlerts(current.players!, item, controllerIndex),
+      },
+    })
+  }
+}
+
+let effectTokenSeq = 0
+let librarySearchSeq = 0
+
+// Token created by a resolving effect. The parser only has the token's name,
+// so borrow the art and type of a same-named token already on any
+// battlefield (one added through the token search) when there is one;
+// otherwise fillMissingTokenArt looks it up.
+function makeEffectToken(players: [Player, Player, Player, Player], tokenName: string): Card {
+  const existing = players
+    .flatMap(player => player.zones.battlefield.cards)
+    .find(card => card.isToken && card.name === tokenName)
+  return {
+    id: `token-${Date.now()}-${effectTokenSeq++}`,
+    name: tokenName,
+    cardType: existing?.cardType ?? (/\bcreature\b/i.test(tokenName) ? 'creature' : 'artifact'),
+    ...(existing?.imageUrl && { imageUrl: existing.imageUrl }),
+    isToken: true,
+    stackCount: 1,
+  }
+}
+
+type TokenArt = Pick<Card, 'imageUrl' | 'cardType'>
+
+function withTokenArt(players: [Player, Player, Player, Player], tokenName: string, art: TokenArt): [Player, Player, Player, Player] {
+  return players.map(player => ({
+    ...player,
+    zones: {
+      ...player.zones,
+      battlefield: {
+        ...player.zones.battlefield,
+        cards: player.zones.battlefield.cards.map(card =>
+          card.isToken && card.name === tokenName && !card.imageUrl ? { ...card, ...art } : card
+        ),
+      },
+    },
+  })) as [Player, Player, Player, Player]
+}
+
+// Resolution never waits on the network: a token with nothing to borrow
+// appears at once as a named tile, and its Scryfall art is filled in when the
+// lookup returns. The fill also reaches undo snapshots and saved steps taken
+// in the meantime, and is not an undoable action itself. On failure the tile
+// stays.
+function fillMissingTokenArt(
+  tokenName: string,
+  get: () => BuilderState,
+  set: (partial: Partial<BuilderState>) => void
+) {
+  const lacksArt = get().players?.some(player =>
+    player.zones.battlefield.cards.some(card => card.isToken && card.name === tokenName && !card.imageUrl)
+  )
+  if (!lacksArt) return
+  fetchTokenCard(tokenName)
+    .then(found => {
+      if (!found?.imageUrl || found.name !== tokenName) return
+      const art: TokenArt = { imageUrl: found.imageUrl, cardType: found.cardType }
+      history = history.map(snapshot => ({ ...snapshot, players: withTokenArt(snapshot.players, tokenName, art) }))
+      const state = get()
+      set({
+        ...(state.players && { players: withTokenArt(state.players, tokenName, art) }),
+        steps: state.steps.map(step => ({
+          ...step,
+          boardState: { ...step.boardState, players: withTokenArt(step.boardState.players, tokenName, art) },
+        })),
+      })
+    })
+    .catch(() => { /* keep the named tile */ })
 }
 
 function placeCardInZone(
@@ -427,6 +603,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
   handSizes: [7, 7, 7, 7],
   turnCounters: cloneCounters(EMPTY_TURN_COUNTERS),
   pendingTriggerPrompt: null,
+  librarySearch: null,
   triggerStackOrder: null,
   steps: [],
   lastSavedLogIndex: 0,
@@ -504,6 +681,8 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
   dismissPendingTriggers: () => set({ pendingTriggerPrompt: null }),
 
+  closeLibrarySearch: () => set({ librarySearch: null }),
+
   saveStep: (label, decisionPoint) => {
     const state = get()
     if (!state.players) return
@@ -554,6 +733,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
         scenarioStarted: ws.scenarioStarted,
         turnCounters: cloneCounters(ws.turnCounters ?? EMPTY_TURN_COUNTERS),
         pendingTriggerPrompt: null,
+        librarySearch: null,
         triggerStackOrder: null,
       })
       return
@@ -579,6 +759,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       scenarioStarted: true,
       turnCounters: cloneCounters(lastStep.boardState.turnCounters ?? EMPTY_TURN_COUNTERS),
       pendingTriggerPrompt: null,
+      librarySearch: null,
       triggerStackOrder: null,
     })
   },
@@ -601,6 +782,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       handSizes: [7, 7, 7, 7],
       turnCounters: cloneCounters(EMPTY_TURN_COUNTERS),
       pendingTriggerPrompt: null,
+      librarySearch: null,
       triggerStackOrder: null,
       steps: [],
       lastSavedLogIndex: 0,
@@ -1144,7 +1326,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     }
 
     const prompt = triggerPromptForEvents(
-      updated, ['opponent-casts', 'opponent-casts-noncreature', 'you-cast-noncreature'], playerIndex, newCounters, card
+      updated, ['opponent-casts', 'opponent-casts-noncreature', 'any-player-casts', 'you-cast-noncreature'], playerIndex, newCounters, card
     )
 
     set({
@@ -1185,22 +1367,20 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     if (item.isStormCopy) {
       // A copy ceases to exist on resolution rather than landing in a zone.
       // A copied tutor still searches as it resolves.
-      const prompt = state.scenarioStarted ? searchPromptOnResolve(state.players, item, state.turnCounters) : null
       set({
         stack: state.stack.filter(s => s.id !== itemId),
-        pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
         logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s storm copy ceases to exist.`] : state.logLines,
       })
+      applyResolution(item, get, set)
       return
     }
 
     if (isAbility(item.type)) {
-      const prompt = state.scenarioStarted ? searchPromptOnResolve(state.players, item, state.turnCounters) : null
       set({
         stack: state.stack.filter(s => s.id !== itemId),
-        pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
         logLines: state.scenarioStarted ? [...state.logLines, `${item.sourceCardName}'s ability resolves.`] : state.logLines,
       })
+      applyResolution(item, get, set)
       return
     }
 
@@ -1212,11 +1392,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       : `${item.sourceCardName} resolves and is put into the graveyard.`
 
     const controllerIndex = updated.findIndex(p => p.name === item.controller)
-    const prompt = !state.scenarioStarted
-      ? null
-      : isPermanent
-        ? (controllerIndex !== -1 ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters) : null)
-        : searchPromptOnResolve(updated, item, state.turnCounters)
+    const prompt = (isPermanent && state.scenarioStarted && controllerIndex !== -1)
+      ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters)
+      : null
 
     set({
       players: updated,
@@ -1224,6 +1402,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
     })
+    applyResolution(item, get, set)
   },
 
   removeFromStack: (itemId) => {
@@ -1370,7 +1549,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     // like Orcish Bowmasters ("except the first one they draw in each of
     // their draw steps") will over-trigger here. The author dismisses the
     // extra prompt; see lib/triggerDetection.ts for the matching note.
-    const prompt = triggerPromptForEvent(updated, 'opponent-draws', playerIndex, newCounters)
+    const prompt = triggerPromptForEvents(updated, ['opponent-draws', 'any-player-draws'], playerIndex, newCounters)
 
     set({
       players: updated,
@@ -1442,6 +1621,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       turnCounters: snapshot.turnCounters,
       // A prompt born from the action being undone is now stale.
       pendingTriggerPrompt: null,
+      librarySearch: null,
     })
   },
 }))

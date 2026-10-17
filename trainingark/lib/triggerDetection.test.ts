@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { detectTriggerTag, detectStormGrant, detectCardMetadata, detectSearchesLibrary } from './triggerDetection'
+import { detectTriggerTag, detectStormGrant, detectCardMetadata, detectSearchesLibrary, detectTriggerEffect, detectCountReplacements } from './triggerDetection'
 
 // Oracle text below is verbatim from Scryfall (fetched while writing these
 // tests), not paraphrased, since the parser is sensitive to exact phrasing.
@@ -7,22 +7,22 @@ import { detectTriggerTag, detectStormGrant, detectCardMetadata, detectSearchesL
 describe('detectTriggerTag — one case per event, using real oracle text', () => {
   it('Rhystic Study -> opponent-casts', () => {
     expect(detectTriggerTag('Whenever an opponent casts a spell, you may draw a card unless that player pays {1}.'))
-      .toEqual({ event: 'opponent-casts' })
+      .toEqual({ event: 'opponent-casts', effect: { kind: 'draw', count: 1 } })
   })
 
   it('Mystic Remora -> opponent-casts-noncreature, no ordinal qualifier', () => {
     const text = 'Cumulative upkeep {1} (At the beginning of your upkeep, put an age counter on this permanent, then sacrifice it unless you pay its upkeep cost for each age counter on it.)\nWhenever an opponent casts a noncreature spell, you may draw a card unless that player pays {4}.'
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-casts-noncreature', qualifier: 'noncreature' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-casts-noncreature', qualifier: 'noncreature', effect: { kind: 'draw', count: 1 } })
   })
 
   it('Esper Sentinel -> opponent-casts-noncreature with spellNumber 1 ("first ... each turn")', () => {
     const text = "Whenever an opponent casts their first noncreature spell each turn, draw a card unless that player pays {X}, where X is this creature's power."
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-casts-noncreature', qualifier: 'noncreature', spellNumber: 1 })
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-casts-noncreature', qualifier: 'noncreature', spellNumber: 1, effect: { kind: 'draw', count: 1 } })
   })
 
-  it('Lotho, Corrupt Shirriff -> opponent-casts with spellNumber 2 and any-player scope ("a player", not "an opponent")', () => {
+  it('Lotho, Corrupt Shirriff -> any-player-casts with spellNumber 2 ("a player", not "an opponent")', () => {
     const text = `Whenever a player casts their second spell each turn, you lose 1 life and create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-casts', spellNumber: 2, controllerScope: 'any-player' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'any-player-casts', spellNumber: 2, effect: { kind: 'createToken', count: 1, tokenName: 'Treasure' } })
   })
 
   it('you-cast-noncreature matches a plain "whenever you cast a noncreature spell" clause', () => {
@@ -32,27 +32,27 @@ describe('detectTriggerTag — one case per event, using real oracle text', () =
 
   it('Smothering Tithe -> opponent-draws', () => {
     const text = `Whenever an opponent draws a card, that player may pay {2}. If the player doesn't, you create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', effect: { kind: 'createToken', count: 1, tokenName: 'Treasure' } })
   })
 
   it('Mulldrifter -> permanent-etb-yours', () => {
     const text = `Flying\nWhen this creature enters, draw two cards.\nEvoke {2}{U} (You may cast this spell for its evoke cost. If you do, it's sacrificed when it enters.)`
-    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours', effect: { kind: 'draw', count: 2 } })
   })
 
   it('Archivist of Oghma -> opponent-searches', () => {
     expect(detectTriggerTag('Flash\nWhenever an opponent searches their library, you gain 1 life and draw a card.'))
-      .toEqual({ event: 'opponent-searches' })
+      .toEqual({ event: 'opponent-searches', effect: { kind: 'draw', count: 1 } })
   })
 
   it('Phyrexian Arena -> your-upkeep', () => {
     expect(detectTriggerTag('At the beginning of your upkeep, you draw a card and lose 1 life.'))
-      .toEqual({ event: 'your-upkeep' })
+      .toEqual({ event: 'your-upkeep', effect: { kind: 'draw', count: 1 } })
   })
 
   it('Ragavan, Nimble Pilferer -> combat-damage-to-player', () => {
     const text = `Whenever Ragavan deals combat damage to a player, create a Treasure token and exile the top card of that player's library. Until end of turn, you may cast that card.\nDash {1}{R} (You may cast this spell for its dash cost. If you do, it gains haste, and it's returned from the battlefield to its owner's hand at the beginning of the next end step.)`
-    expect(detectTriggerTag(text)).toEqual({ event: 'combat-damage-to-player' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'combat-damage-to-player', effect: { kind: 'createToken', count: 1, tokenName: 'Treasure' } })
   })
 
   it('Blood Artist -> creature-dies', () => {
@@ -64,12 +64,86 @@ describe('detectTriggerTag — one case per event, using real oracle text', () =
 describe('detectTriggerTag — ordinal draw triggers ("second card each turn")', () => {
   it('Faerie Mastermind -> opponent-draws with ordinal 2', () => {
     const text = 'Flash\nFlying\nWhenever an opponent draws their second card each turn, you draw a card.\n{3}{U}: Each player draws a card.'
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', spellNumber: 2 })
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', spellNumber: 2, effect: { kind: 'draw', count: 1 } })
   })
 
   it('Gleaming Splendor -> opponent-draws with ordinal 2', () => {
     const text = 'Whenever an opponent draws their second card each turn, you create a Treasure token.\n{2}{W}: Two target players each draw a card.'
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', spellNumber: 2 })
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', spellNumber: 2, effect: { kind: 'createToken', count: 1, tokenName: 'Treasure' } })
+  })
+})
+
+describe('detectTriggerTag — "a player" triggers include the controller (any-player-draws / any-player-casts)', () => {
+  it("King T'Challa's front face -> any-player-draws with ordinal 2 and a draw-1 effect", () => {
+    const text = "Flash\nWhenever a player draws their second card each turn, you draw a card.\n{4}{W}{U}: Transform King T'Challa. Activate only as a sorcery."
+    expect(detectTriggerTag(text)).toEqual({ event: 'any-player-draws', spellNumber: 2, effect: { kind: 'draw', count: 1 } })
+  })
+
+  it('Spiteful Visions -> any-player-draws on every draw, no effect (damage is not modelled)', () => {
+    const text = "At the beginning of each player's draw step, that player draws an additional card.\nWhenever a player draws a card, this enchantment deals 1 damage to that player."
+    expect(detectTriggerTag(text)).toEqual({ event: 'any-player-draws' })
+  })
+
+  it('Ledger Shredder -> any-player-casts with ordinal 2; connive is not a modelled effect', () => {
+    const text = 'Flying\nWhenever a player casts their second spell each turn, this creature connives. (Draw a card, then discard a card. If you discarded a nonland card, put a +1/+1 counter on this creature.)'
+    expect(detectTriggerTag(text)).toEqual({ event: 'any-player-casts', spellNumber: 2 })
+  })
+
+  it('The Lord of Pain -> any-player-casts with ordinal 1', () => {
+    const text = "Menace\nYour opponents can't gain life.\nWhenever a player casts their first spell each turn, choose another target player. The Lord of Pain deals damage equal to that spell's mana value to the chosen player."
+    expect(detectTriggerTag(text)).toEqual({ event: 'any-player-casts', spellNumber: 1 })
+  })
+
+  it('Ruric Thar -> any-player-casts with the noncreature qualifier', () => {
+    const text = 'Reach, vigilance\nRuric Thar attacks each combat if able.\nWhenever a player casts a noncreature spell, Ruric Thar deals 6 damage to that player.'
+    expect(detectTriggerTag(text)).toEqual({ event: 'any-player-casts', qualifier: 'noncreature' })
+  })
+
+  it('conditions the builder cannot check are not suggested on every cast or draw', () => {
+    // Intervening "if" — only free spells.
+    expect(detectTriggerTag('Whenever a player casts a spell, if no mana was spent to cast it, counter that spell.\n{1}, {T}, Sacrifice this artifact: Draw a card.'))
+      .toBeUndefined()
+    // "During their turn" is not the per-turn ordinal the counters track.
+    expect(detectTriggerTag('Whenever a player draws their second card during their turn, you draw a card.\nWhenever a player casts their second spell during their turn, you create a 2/2 white Knight creature token.'))
+      .toBeUndefined()
+    // A narrower spell condition (Possibility Storm).
+    expect(detectTriggerTag('Whenever a player casts a spell from their hand, that player exiles it, then exiles cards from the top of their library until they exile a card that shares a card type with it. That player may cast that card without paying its mana cost. Then they put all cards exiled with this enchantment on the bottom of their library in a random order.'))
+      .toBeUndefined()
+  })
+
+  it("an emblem's quoted trigger is not the planeswalker's own (Ob Nixilis Reignited)", () => {
+    const text = '+1: You draw a card and you lose 1 life.\n−3: Destroy target creature.\n−8: Target opponent gets an emblem with "Whenever a player draws a card, you lose 2 life."'
+    expect(detectTriggerTag(text)).toBeUndefined()
+  })
+})
+
+describe('quoted text is never the card\'s own ability — one guard for every detector', () => {
+  it("Kaito, Cunning Infiltrator is tagged from its own loyalty trigger, never from its emblem's quoted cast trigger", () => {
+    const text = 'Whenever a creature you control deals combat damage to a player, put a loyalty counter on Kaito.\n+1: Up to one target creature you control can\'t be blocked this turn. Draw a card, then discard a card.\n−2: Create a 2/1 blue Ninja creature token.\n−9: You get an emblem with "Whenever a player casts a spell, you create a 2/1 blue Ninja creature token."'
+    expect(detectTriggerTag(text)).toEqual({ event: 'combat-damage-to-player' })
+  })
+
+  it('an ability granted to an enchanted creature is not the Aura\'s (Curious Obsession, The Tabernacle at Pendrell Vale)', () => {
+    expect(detectTriggerTag('Enchant creature\nEnchanted creature gets +1/+1 and has "Whenever this creature deals combat damage to a player, you may draw a card."\nAt the beginning of your end step, if you didn\'t attack with a creature this turn, sacrifice this Aura.'))
+      .toBeUndefined()
+    expect(detectTriggerTag('All creatures have "At the beginning of your upkeep, destroy this creature unless you pay {1}."'))
+      .toBeUndefined()
+  })
+
+  it("Sticky Fingers: the granted combat-damage Treasure trigger is skipped and the Aura's own dies trigger is found", () => {
+    const text = 'Enchant creature\nEnchanted creature has menace and "Whenever this creature deals combat damage to a player, create a Treasure token." (It can\'t be blocked except by two or more creatures. The token is an artifact with "{T}, Sacrifice this token: Add one mana of any color.")\nWhen enchanted creature dies, draw a card.'
+    expect(detectTriggerTag(text)).toEqual({ event: 'creature-dies', effect: { kind: 'draw', count: 1 } })
+  })
+
+  it('a quoted draw inside a trigger\'s effect is not that trigger\'s effect (Sygg grants "... draw a card")', () => {
+    const text = 'Sygg can\'t be blocked.\nWhenever this creature enters or transforms into Sygg, Wanderwine Wisdom, target creature gains "Whenever this creature deals combat damage to a player or planeswalker, draw a card" until end of turn.\nAt the beginning of your first main phase, you may pay {W}. If you do, transform Sygg.'
+    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours' })
+  })
+
+  it("a search in an emblem is not the planeswalker's own search (Tezzeret, Artifice Master)", () => {
+    const text = '+1: Create a 1/1 colorless Thopter artifact creature token with flying.\n0: Draw a card. If you control three or more artifacts, draw two cards instead.\n−9: You get an emblem with "At the beginning of your end step, search your library for a permanent card, put it onto the battlefield, then shuffle."'
+    expect(detectSearchesLibrary(text)).toBe(false)
+    expect(detectCardMetadata(text)).toEqual({})
   })
 })
 
@@ -111,7 +185,7 @@ describe('detectSearchesLibrary — cards that search their controller\'s librar
 
   it('Archivist of Oghma watches for searches but does not search, so it is tagged but not flagged', () => {
     const metadata = detectCardMetadata('Flash\nWhenever an opponent searches their library, you gain 1 life and draw a card.', ['Flash'])
-    expect(metadata).toEqual({ triggerTag: { event: 'opponent-searches' } })
+    expect(metadata).toEqual({ triggerTag: { event: 'opponent-searches', effect: { kind: 'draw', count: 1 } } })
   })
 })
 
@@ -169,5 +243,77 @@ describe('storm detection', () => {
 
   it('detectCardMetadata returns an empty object when there is no oracle text and no keywords', () => {
     expect(detectCardMetadata(undefined, undefined)).toEqual({})
+  })
+})
+
+describe('trigger effects — parsed from the trigger\'s own paragraph, verbatim Scryfall text', () => {
+  const draws: [string, string, number][] = [
+    ['Rhystic Study', 'Whenever an opponent casts a spell, you may draw a card unless that player pays {1}.', 1],
+    ['Mystic Remora', 'Cumulative upkeep {1} (At the beginning of your upkeep, put an age counter on this permanent, then sacrifice it unless you pay its upkeep cost for each age counter on it.)\nWhenever an opponent casts a noncreature spell, you may draw a card unless that player pays {4}.', 1],
+    ['Esper Sentinel', "Whenever an opponent casts their first noncreature spell each turn, draw a card unless that player pays {X}, where X is this creature's power.", 1],
+    ['Faerie Mastermind', 'Flash\nFlying\nWhenever an opponent draws their second card each turn, you draw a card.\n{3}{U}: Each player draws a card.', 1],
+    ['Phyrexian Arena', 'At the beginning of your upkeep, you draw a card and lose 1 life.', 1],
+    ['Consecrated Sphinx', 'Flying\nWhenever an opponent draws a card, you may draw two cards.', 2],
+    ['Mulldrifter', "Flying\nWhen this creature enters, draw two cards.\nEvoke {2}{U} (You may cast this spell for its evoke cost. If you do, it's sacrificed when it enters.)", 2],
+  ]
+
+  it.each(draws)('%s -> draw %i', (_name, text, count) => {
+    expect(detectTriggerTag(text)?.effect).toEqual({ kind: 'draw', count })
+  })
+
+  const treasures: [string, string][] = [
+    ['Smothering Tithe', `Whenever an opponent draws a card, that player may pay {2}. If the player doesn't, you create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`],
+    ['Gleaming Splendor', 'Whenever an opponent draws their second card each turn, you create a Treasure token.\n{2}{W}: Two target players each draw a card.'],
+    ['Lotho, Corrupt Shirriff', `Whenever a player casts their second spell each turn, you lose 1 life and create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`],
+  ]
+
+  it.each(treasures)('%s -> create 1 Treasure (name read from the text)', (_name, text) => {
+    expect(detectTriggerTag(text)?.effect).toEqual({ kind: 'createToken', count: 1, tokenName: 'Treasure' })
+  })
+
+  it("another ability's draw on the same card is never taken as the trigger's effect (Gleaming Splendor's {2}{W} line)", () => {
+    const text = 'Whenever an opponent draws their second card each turn, you create a Treasure token.\n{2}{W}: Two target players each draw a card.'
+    expect(detectTriggerTag(text)?.effect?.kind).toBe('createToken')
+  })
+
+  it('effects the builder does not model get no effect: damage (Orcish Bowmasters), life (Blood Artist)', () => {
+    const bowmasters = 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.'
+    expect(detectTriggerTag(bowmasters)).toEqual({ event: 'opponent-draws' })
+    expect(detectTriggerTag('Whenever this creature or another creature dies, target player loses 1 life and you gain 1 life.'))
+      .toEqual({ event: 'creature-dies' })
+  })
+
+  it("draws by someone other than the trigger's controller, and uncountable draws, get no effect", () => {
+    expect(detectTriggerEffect('each player draws a card.')).toBeUndefined()
+    expect(detectTriggerEffect('that player draws a card.')).toBeUndefined()
+    expect(detectTriggerEffect('two target players each draw a card.')).toBeUndefined()
+    expect(detectTriggerEffect('draw X cards, where X is the number of artifacts you control.')).toBeUndefined()
+  })
+})
+
+describe('detectCountReplacements — verbatim Scryfall text', () => {
+  it("Alhammarret's Archive changes its controller's draws (and its life clause is not a draw/token replacement)", () => {
+    const text = 'If you would gain life, you gain twice that much life instead.\nIf you would draw a card except the first one you draw in each of your draw steps, draw two cards instead.'
+    expect(detectCountReplacements(text)).toEqual([{ kind: 'draw', affects: 'controller' }])
+  })
+
+  it("Notion Thief changes opponents' draws", () => {
+    const text = 'Flash\nIf an opponent would draw a card except the first one they draw in each of their draw steps, instead that player skips that draw and you draw a card.'
+    expect(detectCountReplacements(text)).toEqual([{ kind: 'draw', affects: 'opponents' }])
+  })
+
+  it('Anointed Procession ("If an effect would create ... tokens") changes its controller\'s tokens', () => {
+    const text = 'If an effect would create one or more tokens under your control, it creates twice that many of those tokens instead.'
+    expect(detectCountReplacements(text)).toEqual([{ kind: 'createToken', affects: 'controller' }])
+  })
+
+  it('Mondrak ("If one or more tokens would be created") — passive phrasing a plain "would create" pattern misses', () => {
+    const text = 'If one or more tokens would be created under your control, twice that many of those tokens are created instead.\n{1}{W/P}{W/P}, Sacrifice two other artifacts and/or creatures: Put an indestructible counter on Mondrak. ({W/P} can be paid with either {W} or 2 life.)'
+    expect(detectCountReplacements(text)).toEqual([{ kind: 'createToken', affects: 'controller' }])
+  })
+
+  it('Opposition Agent and Rhystic Study have none, and detectCardMetadata stores the list only when non-empty', () => {
+    expect(detectCountReplacements("Flash\nYou control your opponents while they're searching their libraries.\nWhile an opponent is searching their library, they exile each card they find. You may play those cards for as long as they remain exiled, and you may spend mana as though it were mana of any color to cast them.")).toEqual([])
+    expect(detectCardMetadata('Whenever an opponent casts a spell, you may draw a card unless that player pays {1}.')).not.toHaveProperty('countReplacements')
   })
 })

@@ -11,6 +11,7 @@ import { ZoneMenu, type ZoneMenuItem } from './ZoneMenu'
 import { CommanderSetupModal } from './CommanderSetupModal'
 import { useBuilderStore, makeUnknownCard, type EditableZone } from '@/store/builderStore'
 import { detectCardMetadata } from '@/lib/triggerDetection'
+import { cardFromScryfall, fetchTokenCard, parseCardType } from '@/lib/scryfallCard'
 
 interface PlayerZoneProps {
   playerIndex: number
@@ -41,18 +42,6 @@ const ZONE_TARGET_MAP: Record<ZoneTarget, EditableZone> = {
   'library-top': 'library',
   'library-bottom': 'library',
   command: 'command',
-}
-
-function parseCardType(typeLine: string): Card['cardType'] {
-  if (typeLine.includes('Creature')) return 'creature'
-  if (typeLine.includes('Land')) return 'land'
-  if (typeLine.includes('Planeswalker')) return 'planeswalker'
-  if (typeLine.includes('Artifact')) return 'artifact'
-  if (typeLine.includes('Enchantment')) return 'enchantment'
-  if (typeLine.includes('Instant')) return 'instant'
-  if (typeLine.includes('Sorcery')) return 'sorcery'
-  if (typeLine.includes('Battle')) return 'battle'
-  return 'artifact'
 }
 
 export function cleanDecklistLine(rawLine: string): string {
@@ -100,7 +89,7 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
     handSizes, setHandSize,
     turnCounters, setSpellsCastThisTurn, setCardsDrawnThisTurn,
     isDuplicate, dismissDuplicateWarning, dismissedDuplicateWarnings,
-    populateLibrary,
+    populateLibrary, librarySearch, closeLibrarySearch,
   } = useBuilderStore()
 
   const player = viewMode ? playerOverride : players?.[playerIndex]
@@ -138,6 +127,17 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const handFanRef = useRef<HTMLDivElement>(null)
   const [fanWidth, setFanWidth] = useState(200)
   const [cardW, setCardW] = useState(80)
+  const [openedSearchId, setOpenedSearchId] = useState<number | null>(null)
+
+  // A library search resolving for this seat opens the existing library
+  // view. Adjusting state during render (rather than in an effect) opens it
+  // in the same paint as the resolution.
+  const activeSearch = !viewMode && librarySearch?.playerIndex === playerIndex ? librarySearch : null
+  if (activeSearch && activeSearch.requestId !== openedSearchId) {
+    setOpenedSearchId(activeSearch.requestId)
+    setFilterText('')
+    setExpanded('library')
+  }
 
   useEffect(() => {
     const el = handFanRef.current
@@ -155,9 +155,18 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const isTop = position === 'top-left' || position === 'top-right'
   const isRight = position === 'top-right' || position === 'bottom-right'
 
+  function closeExpanded() {
+    setExpanded(null)
+    if (activeSearch) closeLibrarySearch()
+  }
+
   function toggle(zone: ExpandableZone) {
+    if (expanded === zone) {
+      closeExpanded()
+      return
+    }
     setFilterText('')
-    setExpanded(prev => prev === zone ? null : zone)
+    setExpanded(zone)
   }
 
   function zoneCount(zoneName: keyof Player['zones']): number {
@@ -619,12 +628,17 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
     ? expandedCardsRaw.filter(c => c.name.toLowerCase().includes(filterText.toLowerCase()))
     : expandedCardsRaw
 
+  const searchingLibrary = expanded === 'library' && activeSearch !== null
+
   const expandedPanel = expanded && (
     <div className={styles.expandedPanel}>
       <div className={styles.expandedHeader}>
-        <span>Viewing {expanded[0].toUpperCase() + expanded.slice(1)}</span>
-        <button className={styles.closeExpanded} onClick={() => setExpanded(null)}>×</button>
+        <span>{searchingLibrary ? 'Searching Library' : `Viewing ${expanded[0].toUpperCase() + expanded.slice(1)}`}</span>
+        <button className={styles.closeExpanded} onClick={closeExpanded}>×</button>
       </div>
+      {searchingLibrary && activeSearch.alerts.map(alert => (
+        <p key={alert} className={styles.searchAlert}>⚠ {alert}</p>
+      ))}
       <div className={styles.expandedList}>
         {expandedCards.length === 0 && (
           <p className={styles.emptyZoneText}>No cards here.</p>
@@ -1206,40 +1220,15 @@ function CardAddSearch({ decklist, tokensOnly, onSelect, onClose }: {
 
   async function selectCard(name: string) {
     try {
-      const url = tokensOnly
-        ? `https://api.scryfall.com/cards/search?q=${encodeURIComponent(`is:token !"${name}"`)}&unique=cards`
-        : `https://api.scryfall.com/cards/named?exact=${encodeURIComponent(name)}`
-      const res = await fetch(url)
-      if (!res.ok) return
-      const data = await res.json()
-      const cardData = tokensOnly ? data.data?.[0] : data
-      if (!cardData) return
-      const card: Card = {
-        id: cardData.id,
-        name: (() => {
-          if (tokensOnly && cardData.card_faces && cardData.name.includes('//')) {
-            const match = cardData.card_faces.find(
-              (f: { name: string }) => f.name.toLowerCase().includes(name.toLowerCase())
-            )
-            return match?.name ?? cardData.name
-          }
-          return cardData.name
-        })(),
-        imageUrl: cardData.image_uris?.normal ?? (() => {
-          if (!cardData.card_faces) return undefined
-          const match = cardData.card_faces.find(
-            (f: { name: string }) => f.name.toLowerCase().includes(name.toLowerCase())
-          )
-          return (match ?? cardData.card_faces[0])?.image_uris?.normal
-        })(),
-        cardType: parseCardType(cardData.type_line ?? ''),
-        isToken: tokensOnly ? true : undefined,
-        ...detectCardMetadata(
-          cardData.oracle_text ?? cardData.card_faces?.[0]?.oracle_text,
-          cardData.keywords ?? cardData.card_faces?.[0]?.keywords
-        ),
+      let card: Card | undefined
+      if (tokensOnly) {
+        card = await fetchTokenCard(name)
+      } else {
+        const res = await fetch(`https://api.scryfall.com/cards/named?exact=${encodeURIComponent(name)}`)
+        if (!res.ok) return
+        card = cardFromScryfall(await res.json(), name, false)
       }
-      onSelect(card)
+      if (card) onSelect(card)
     } catch { /* ignore */ }
   }
 

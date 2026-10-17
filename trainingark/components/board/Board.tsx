@@ -1,6 +1,6 @@
 'use client'
 
-import { useBuilderStore } from '@/store/builderStore'
+import { useBuilderStore, resolutionAlerts } from '@/store/builderStore'
 import type { Player, StackItem } from '@/types/board'
 import { PlayerZone } from './PlayerZone'
 import { TriggerPrompt } from './TriggerPrompt'
@@ -19,7 +19,7 @@ interface BoardProps {
 }
 
 export function Board({ revealAll, viewMode, snapshot }: BoardProps) {
-  const { stack: storeStack, resolveStack, removeFromStack, exileFromStack, setStormCopyCount } = useBuilderStore()
+  const { players, stack: storeStack, resolveStack, removeFromStack, exileFromStack, setStormCopyCount } = useBuilderStore()
 
   const stack = viewMode && snapshot ? snapshot.stack : storeStack
 
@@ -69,6 +69,12 @@ export function Board({ revealAll, viewMode, snapshot }: BoardProps) {
                     )}
                   </div>
                 )}
+                {/* Authoring-only: board permanents that make the parsed
+                    effect inaccurate. Resolving still does exactly what was
+                    parsed; the note tells the author what to fix by hand. */}
+                {!viewMode && players && resolutionAlerts(players, item).map(alert => (
+                  <div key={alert} className={styles.stackAlert}>⚠ {alert}</div>
+                ))}
               </div>
             ))}
           </div>

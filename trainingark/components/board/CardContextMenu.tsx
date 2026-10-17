@@ -87,7 +87,9 @@ export function CardContextMenu({
       </button>
       <div className={styles.menuDivider} />
       {(Object.entries(EVENT_TYPE_LABELS) as [TriggerTag['event'], string][]).map(([event, label]) => (
-        <button key={event} className={styles.menuItem} onClick={() => { onSetTriggerTag?.({ event }); onClose() }}>
+        // Re-tagging corrects WHEN the ability triggers; what it does when it
+        // resolves was parsed from the card and is kept.
+        <button key={event} className={styles.menuItem} onClick={() => { onSetTriggerTag?.({ event, ...(triggerTag?.effect && { effect: triggerTag.effect }) }); onClose() }}>
           {label}
         </button>
       ))}
@@ -170,26 +172,24 @@ export function CardContextMenu({
         </button>
       )}
 
-      {!isLand && (
-        <>
-          <div className={styles.menuDivider} />
-          {!onBattlefield && (
-            <button className={styles.menuItem} onClick={() => { onCastToStack('cast'); onClose() }}>
-              Cast to Stack
-            </button>
-          )}
-          <button className={styles.menuItem} onClick={() => { onCastToStack('triggered'); onClose() }}>
-            Add Triggered Ability
-          </button>
-          <button className={styles.menuItem} onClick={() => { onCastToStack('activated'); onClose() }}>
-            Add Activated Ability
-          </button>
-          {onSetTriggerTag && (
-            <button className={styles.menuItem} onClick={() => setView('triggerTag')}>
-              Set Trigger Tag{triggerTag ? ` (${EVENT_TYPE_LABELS[triggerTag.event]})` : '...'}
-            </button>
-          )}
-        </>
+      <div className={styles.menuDivider} />
+      {/* Lands are played, never cast — but they do have abilities that use
+          the stack (cracking a fetch land) and triggers (a Temple's scry). */}
+      {!isLand && !onBattlefield && (
+        <button className={styles.menuItem} onClick={() => { onCastToStack('cast'); onClose() }}>
+          Cast to Stack
+        </button>
+      )}
+      <button className={styles.menuItem} onClick={() => { onCastToStack('triggered'); onClose() }}>
+        Add Triggered Ability
+      </button>
+      <button className={styles.menuItem} onClick={() => { onCastToStack('activated'); onClose() }}>
+        Add Activated Ability
+      </button>
+      {onSetTriggerTag && (
+        <button className={styles.menuItem} onClick={() => setView('triggerTag')}>
+          Set Trigger Tag{triggerTag ? ` (${EVENT_TYPE_LABELS[triggerTag.event]})` : '...'}
+        </button>
       )}
 
       {onBattlefield && onCreateTokenCopy && (

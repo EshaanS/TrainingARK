@@ -132,13 +132,20 @@ export function BoardCard({
         onMouseLeave={() => setHovered(false)}
         onContextMenu={handleContextMenu}
       >
-        <Image
-          src={src}
-          alt={card.name}
-          width={80}
-          height={112}
-          style={{ borderRadius: 4, display: 'block', width: '100%', height: '100%' }}
-        />
+        {/* A token created by a resolving trigger has only a name until its
+            Scryfall art arrives, or for good if the lookup fails. The card
+            back would read as a hidden card, so show the name instead. */}
+        {isToken && !card.imageUrl ? (
+          <div className={styles.namedToken}>{card.name}</div>
+        ) : (
+          <Image
+            src={src}
+            alt={card.name}
+            width={80}
+            height={112}
+            style={{ borderRadius: 4, display: 'block', width: '100%', height: '100%' }}
+          />
+        )}
 
         {!readOnly && hovered && (
           <button className={styles.dotsBtn} onClick={handleDotsClick}>
