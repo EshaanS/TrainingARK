@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useBuilderStore, resolutionAlerts, type DecisionPoint } from './builderStore'
-import type { Card } from '@/types/board'
+import { useBuilderStore, resolutionAlerts, discardsToHandSize, type DecisionPoint } from './builderStore'
+import type { Card, TurnCounters } from '@/types/board'
 import { detectCardMetadata } from '@/lib/triggerDetection'
 import { fetchTokenCard } from '@/lib/scryfallCard'
 
@@ -631,10 +631,10 @@ describe('turn counters: auto-increment on cast/draw, reset on passTurn', () => 
     expect(useBuilderStore.getState().turnCounters.cardsDrawnThisTurn[0]).toBe(1)
   })
 
-  it('passTurn resets all three counters to zero for every player', () => {
+  it('passTurn resets every counter to zero for every player, land drops included', () => {
     withScenarioStarted()
     useBuilderStore.setState({
-      turnCounters: { spellsCastThisTurn: [3, 1, 0, 2], totalSpellsCastThisTurn: 6, cardsDrawnThisTurn: [2, 0, 1, 0] },
+      turnCounters: { spellsCastThisTurn: [3, 1, 0, 2], totalSpellsCastThisTurn: 6, cardsDrawnThisTurn: [2, 0, 1, 0], landDropsThisTurn: [1, 0, 2, 0] },
     })
 
     useBuilderStore.getState().passTurn()
@@ -643,6 +643,7 @@ describe('turn counters: auto-increment on cast/draw, reset on passTurn', () => 
       spellsCastThisTurn: [0, 0, 0, 0],
       totalSpellsCastThisTurn: 0,
       cardsDrawnThisTurn: [0, 0, 0, 0],
+      landDropsThisTurn: [0, 0, 0, 0],
     })
   })
 })
@@ -1646,6 +1647,262 @@ describe('trigger effects on resolution', () => {
     it('Opposition Agent does not alert on items that do not search', () => {
       castIntoRhysticStudy({ 1: [fromText('agent', 'Opposition Agent', 'creature', OPPOSITION_AGENT)] })
       expect(resolutionAlerts(state().players!, topOfStack())).toEqual([])
+    })
+  })
+})
+
+describe('turn bookkeeping: doesNotUntap, drawForTurn, pass turn at upkeep, cleanup discards, land drops', () => {
+  // Verbatim Scryfall oracle text.
+  const ORCISH_BOWMASTERS = 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.'
+  const SMOTHERING_TITHE = `Whenever an opponent draws a card, that player may pay {2}. If the player doesn't, you create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`
+  const FAERIE_MASTERMIND = 'Flash\nFlying\nWhenever an opponent draws their second card each turn, you draw a card.\n{3}{U}: Each player draws a card.'
+
+  const state = () => useBuilderStore.getState()
+  const battlefield = (playerIndex: number) => state().players![playerIndex].zones.battlefield.cards
+  const handCount = (playerIndex: number) => state().players![playerIndex].zones.hand.cardCount ?? 0
+  const promptedNames = () => state().pendingTriggerPrompt?.triggers.map(t => t.sourceCard.name)
+  const lands = () => state().turnCounters.landDropsThisTurn
+
+  describe('doesNotUntap', () => {
+    const pinned = () => card({ id: 'pinned', name: 'Grim Monolith', cardType: 'artifact', tapped: true, doesNotUntap: true })
+    const ordinary = () => card({ id: 'ordinary', name: 'Sol Ring', cardType: 'artifact', tapped: true })
+
+    it('Untap All leaves a doesNotUntap card tapped and untaps the rest, silently', () => {
+      withScenarioStarted()
+      withBattlefieldCards(0, [pinned(), ordinary()])
+      const logBefore = state().logLines
+
+      state().untapAll(0)
+
+      expect(battlefield(0).find(c => c.id === 'pinned')).toMatchObject({ tapped: true, doesNotUntap: true })
+      expect(battlefield(0).find(c => c.id === 'ordinary')?.tapped).toBe(false)
+      expect(state().logLines).toEqual(logBefore)
+    })
+
+    it("passTurn's untap step leaves the new active player's doesNotUntap card tapped, with no log line about it", () => {
+      withScenarioStarted()
+      withBattlefieldCards(1, [pinned(), ordinary()])
+
+      state().passTurn()
+
+      expect(state().currentTurnPlayerIndex).toBe(1)
+      expect(battlefield(1).find(c => c.id === 'pinned')).toMatchObject({ tapped: true, doesNotUntap: true })
+      expect(battlefield(1).find(c => c.id === 'ordinary')?.tapped).toBe(false)
+      expect(state().logLines.some(line => line.includes('Grim Monolith'))).toBe(false)
+    })
+  })
+
+  describe('drawForTurn', () => {
+    function withBowmastersAndTithe() {
+      withScenarioStarted()
+      withBattlefieldCards(1, [
+        card({ id: 'bowmasters', name: 'Orcish Bowmasters', cardType: 'creature', ...detectCardMetadata(ORCISH_BOWMASTERS) }),
+        card({ id: 'tithe', name: 'Smothering Tithe', cardType: 'enchantment', ...detectCardMetadata(SMOTHERING_TITHE) }),
+      ])
+      withLibrary(0, 5)
+    }
+
+    it('moves the top card to hand and counts the draw exactly like drawCard, and says it is the draw for the turn', () => {
+      withBowmastersAndTithe()
+      const topCard = state().players![0].zones.library.cards.at(-1)!
+
+      state().drawForTurn(0)
+
+      expect(state().players![0].zones.hand.cards.map(c => c.id)).toEqual([topCard.id])
+      expect(state().players![0].zones.library.cardCount).toBe(4)
+      expect(state().turnCounters.cardsDrawnThisTurn[0]).toBe(1)
+      expect(state().logLines.at(-1)).toBe('Player draws for the turn.')
+    })
+
+    it('does not trigger Orcish Bowmasters, while ordinary draw triggers (Smothering Tithe) still fire', () => {
+      withBowmastersAndTithe()
+
+      state().drawForTurn(0)
+
+      expect(promptedNames()).toEqual(['Smothering Tithe'])
+    })
+
+    it('an ordinary draw still triggers Bowmasters — an upkeep draw before the draw step, and a draw after it', () => {
+      withBowmastersAndTithe()
+
+      state().drawCard(0)
+      expect(promptedNames()).toEqual(['Orcish Bowmasters', 'Smothering Tithe'])
+      state().dismissPendingTriggers()
+
+      state().drawForTurn(0)
+      expect(promptedNames()).toEqual(['Smothering Tithe'])
+      state().dismissPendingTriggers()
+
+      state().drawCard(0)
+      expect(promptedNames()).toEqual(['Orcish Bowmasters', 'Smothering Tithe'])
+    })
+
+    it('counts toward "second card each turn" like any draw (Faerie Mastermind fires on the draw after it)', () => {
+      withScenarioStarted()
+      withBattlefieldCards(1, [card({ id: 'mastermind', name: 'Faerie Mastermind', cardType: 'creature', ...detectCardMetadata(FAERIE_MASTERMIND) })])
+      withLibrary(0, 5)
+
+      state().drawForTurn(0)
+      expect(state().pendingTriggerPrompt).toBeNull()
+      state().drawCard(0)
+      expect(promptedNames()).toEqual(['Faerie Mastermind'])
+    })
+
+    it('is one undo step', () => {
+      withBowmastersAndTithe()
+      state().drawForTurn(0)
+      state().undoLastAction()
+      expect(handCount(0)).toBe(0)
+      expect(state().turnCounters.cardsDrawnThisTurn[0]).toBe(0)
+    })
+  })
+
+  describe('passTurn stops at upkeep', () => {
+    it('advances, untaps, resets counters, and offers upkeep triggers, but draws nothing for the new active player', () => {
+      withScenarioStarted()
+      withLibrary(1, 5)
+      withBattlefieldCards(1, [card({ id: 'arena', name: 'Phyrexian Arena', cardType: 'enchantment', triggerTag: { event: 'your-upkeep' } })])
+
+      state().passTurn()
+
+      expect(state().currentTurnPlayerIndex).toBe(1)
+      expect(handCount(1)).toBe(0)
+      expect(state().players![1].zones.library.cardCount).toBe(5)
+      expect(state().turnCounters.cardsDrawnThisTurn).toEqual([0, 0, 0, 0])
+      expect(promptedNames()).toEqual(['Phyrexian Arena'])
+      expect(state().logLines.some(line => line.includes('draws'))).toBe(false)
+    })
+  })
+
+  // The discard modal's two buttons: "Discard and pass turn" discards then
+  // calls passTurn; "Discard only" discards and leaves the turn where it is.
+  // Pass Turn opens the modal only while discardsToHandSize is above zero.
+  describe('cleanup discards', () => {
+    function withNineCardHand() {
+      withScenarioStarted()
+      withHandCards(0, Array.from({ length: 9 }, (_, i) => card({ id: `h${i}`, name: `Card ${i}`, cardType: 'instant' })))
+    }
+    const discardsNeeded = () => discardsToHandSize(state().players![0], state().handSizes[0])
+
+    it('Discard and pass turn: discarding down then passing ends the turn with no discard warning', () => {
+      withNineCardHand()
+      expect(discardsNeeded()).toBe(2)
+
+      state().moveCard(0, 'h0', 'hand', 'graveyard')
+      state().moveCard(0, 'h1', 'hand', 'graveyard')
+      expect(discardsNeeded()).toBe(0)
+      state().passTurn()
+
+      expect(state().currentTurnPlayerIndex).toBe(1)
+      expect(state().players![0].zones.graveyard.cards.map(c => c.id)).toEqual(['h0', 'h1'])
+      expect(state().logLines.some(line => line.includes('must discard'))).toBe(false)
+    })
+
+    it('Discard only: the turn stays put so a discard trigger can go on the stack and resolve, and the next Pass Turn just passes', () => {
+      withNineCardHand()
+      withBattlefieldCards(0, [card({ id: 'waste-not', name: 'Waste Not', cardType: 'enchantment' })])
+
+      state().moveCard(0, 'h0', 'hand', 'graveyard')
+      state().moveCard(0, 'h1', 'hand', 'graveyard')
+      expect(state().currentTurnPlayerIndex).toBe(0)
+
+      state().castToStack(0, 'waste-not', 'battlefield', 'triggered')
+      state().resolveStack(state().stack.at(-1)!.id)
+      expect(state().stack).toEqual([])
+      expect(state().currentTurnPlayerIndex).toBe(0)
+
+      expect(discardsNeeded()).toBe(0)
+      state().passTurn()
+      expect(state().currentTurnPlayerIndex).toBe(1)
+      expect(state().logLines.some(line => line.includes('must discard'))).toBe(false)
+    })
+
+    it('Skip cleanup still passes over hand size and notes the required discard', () => {
+      withNineCardHand()
+      state().passTurn()
+      expect(state().currentTurnPlayerIndex).toBe(1)
+      expect(state().logLines).toContain('Player must discard down to 7 cards.')
+    })
+  })
+
+  describe('land drops', () => {
+    const forest = (id = 'forest') => card({ id, name: 'Forest', cardType: 'land' })
+
+    it('counts a land moving from hand to the battlefield, for that player only', () => {
+      withScenarioStarted()
+      withHandCards(2, [forest(), card({ id: 'bear', name: 'Grizzly Bears', cardType: 'creature' })])
+
+      state().moveCard(2, 'forest', 'hand', 'battlefield')
+      state().moveCard(2, 'bear', 'hand', 'battlefield')
+
+      expect(lands()).toEqual([0, 0, 1, 0])
+    })
+
+    it('counts every way a land arrives, with no limit: from the graveyard, from the library, added directly, resolved from the stack, en masse', () => {
+      withScenarioStarted()
+      const players = state().players!
+      const updated = [...players] as typeof players
+      updated[0] = {
+        ...players[0],
+        zones: {
+          ...players[0].zones,
+          graveyard: { cards: [forest('gy-forest')], revealed: true, cardCount: 1 },
+          library: { cards: [forest('lib-forest')], revealed: false, cardCount: 1 },
+          exile: { cards: [forest('ex-1'), forest('ex-2'), card({ id: 'ex-spell', name: 'Brainstorm', cardType: 'instant' })], revealed: true, cardCount: 3 },
+          hand: { cards: [forest('hand-forest')], revealed: false, cardCount: 1 },
+        },
+      }
+      useBuilderStore.setState({ players: updated })
+
+      state().moveCard(0, 'gy-forest', 'graveyard', 'battlefield')
+      state().moveCard(0, 'lib-forest', 'library', 'battlefield')
+      state().addCard(0, 'battlefield', forest('added'))
+      state().castToStack(0, 'hand-forest', 'hand', 'cast')
+      state().resolveStack(state().stack.at(-1)!.id)
+      state().moveAllCards(0, 'exile', 'battlefield')
+
+      expect(lands()[0]).toBe(6)
+    })
+
+    it('does not count before the scenario starts (setup is board construction)', () => {
+      withHandCards(0, [forest()])
+      state().moveCard(0, 'forest', 'hand', 'battlefield')
+      expect(lands()).toEqual([0, 0, 0, 0])
+    })
+
+    it('is author-editable, clamped at zero, resets on passTurn, and undoes with the move', () => {
+      withScenarioStarted()
+      withHandCards(0, [forest()])
+
+      state().moveCard(0, 'forest', 'hand', 'battlefield')
+      expect(lands()[0]).toBe(1)
+      state().undoLastAction()
+      expect(lands()[0]).toBe(0)
+
+      state().setLandDropsThisTurn(1, 3)
+      expect(lands()).toEqual([0, 3, 0, 0])
+      state().setLandDropsThisTurn(1, -2)
+      expect(lands()[1]).toBe(0)
+
+      state().setLandDropsThisTurn(0, 2)
+      state().passTurn()
+      expect(lands()).toEqual([0, 0, 0, 0])
+    })
+
+    it('a scenario saved before land drops existed loads with them at zero', () => {
+      const { players, steps } = state()
+      state().loadScenario({
+        title: 'Old save', description: '', difficulty: 'beginner',
+        data: {
+          steps, decklists: [[], [], [], []], firstPlayerIndex: 0, currentTurnPlayerIndex: 0, turnNumber: 1, handSizes: [7, 7, 7, 7],
+          workingState: {
+            players: players!, stack: [], logLines: [], lastSavedLogIndex: 0, setupComplete: [true, true, true, true], scenarioStarted: true,
+            turnCounters: { spellsCastThisTurn: [1, 0, 0, 0], totalSpellsCastThisTurn: 1, cardsDrawnThisTurn: [0, 0, 0, 0] } as unknown as TurnCounters,
+          },
+        },
+      })
+      expect(state().turnCounters.landDropsThisTurn).toEqual([0, 0, 0, 0])
+      expect(state().turnCounters.spellsCastThisTurn).toEqual([1, 0, 0, 0])
     })
   })
 })

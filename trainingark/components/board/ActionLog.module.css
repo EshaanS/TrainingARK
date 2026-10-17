@@ -361,6 +361,24 @@
   border-color: rgba(255, 255, 255, 0.2);
 }
 
+.discardOnlyBtn {
+  background: none;
+  border: 1px solid rgba(201, 168, 76, 0.5);
+  border-radius: 6px;
+  color: #e8c96a;
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 8px 16px;
+  transition: border-color 0.1s, background 0.1s;
+}
+
+.discardOnlyBtn:hover:not(:disabled) {
+  border-color: #c9a84c;
+  background: rgba(201, 168, 76, 0.1);
+}
+
+.discardOnlyBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
 .discardDoneBtn {
   background: #8b6914;
   border: none;

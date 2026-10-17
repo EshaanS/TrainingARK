@@ -93,6 +93,9 @@ interface BuilderState {
   toggleDoesNotUntap: (playerIndex: number, cardId: string) => void
   setTriggerTag: (playerIndex: number, cardId: string, triggerTag?: TriggerTag) => void
   drawCard: (playerIndex: number) => void
+  // The turn-based draw-step draw. Only the author knows which draw that is
+  // (upkeep triggers can draw first), so it is a separate action.
+  drawForTurn: (playerIndex: number) => void
   shuffleLibrary: (playerIndex: number) => void
   populateLibrary: (playerIndex: number, cards: Card[]) => void
   untapAll: (playerIndex: number) => void
@@ -104,6 +107,7 @@ interface BuilderState {
   setSpellsCastThisTurn: (playerIndex: number, count: number) => void
   setTotalSpellsCastThisTurn: (count: number) => void
   setCardsDrawnThisTurn: (playerIndex: number, count: number) => void
+  setLandDropsThisTurn: (playerIndex: number, count: number) => void
   acceptPendingTriggers: (order?: TriggerStackOrder) => void
   dismissPendingTriggers: () => void
   closeLibrarySearch: () => void
@@ -157,6 +161,7 @@ const EMPTY_TURN_COUNTERS: TurnCounters = {
   spellsCastThisTurn: [0, 0, 0, 0],
   totalSpellsCastThisTurn: 0,
   cardsDrawnThisTurn: [0, 0, 0, 0],
+  landDropsThisTurn: [0, 0, 0, 0],
 }
 
 const emptyZones = {
@@ -233,7 +238,37 @@ function cloneCounters(counters: TurnCounters): TurnCounters {
     spellsCastThisTurn: [...counters.spellsCastThisTurn] as TurnCounters['spellsCastThisTurn'],
     totalSpellsCastThisTurn: counters.totalSpellsCastThisTurn,
     cardsDrawnThisTurn: [...counters.cardsDrawnThisTurn] as TurnCounters['cardsDrawnThisTurn'],
+    // Scenarios saved before land drops were counted have no such field.
+    landDropsThisTurn: [...(counters.landDropsThisTurn ?? EMPTY_TURN_COUNTERS.landDropsThisTurn)] as TurnCounters['landDropsThisTurn'],
   }
+}
+
+// Every land that reaches a battlefield after the scenario starts counts as a
+// land drop — played, fetched, returned from a graveyard, or a token copy.
+// The engine cannot tell which of those the author means, so it counts them
+// all and the author corrects the number.
+function withLandsEntered(counters: TurnCounters, playerIndex: number, cards: Card[]): TurnCounters {
+  const lands = cards.filter(card => card.cardType === 'land').length
+  if (lands === 0) return counters
+  const next = cloneCounters(counters)
+  next.landDropsThisTurn[playerIndex] += lands
+  return next
+}
+
+// Cards a player must discard in cleanup to get down to their hand size. The
+// Pass Turn button opens the discard modal when this is above zero, and
+// returns to a plain pass once the author has discarded down, which is how
+// "Discard only" hands the turn back for discard triggers.
+export function discardsToHandSize(player: Player, handSize: number): number {
+  const handCount = player.zones.hand.cardCount ?? player.zones.hand.cards.length
+  return Math.max(0, handCount - handSize)
+}
+
+// Both untap paths (Untap All, and the new active player's untap step in
+// passTurn) leave a doesNotUntap card exactly as it is. Its badge is the only
+// sign; nothing is logged.
+function untapUnlessPinned(card: Card): Card {
+  return card.doesNotUntap ? card : { ...card, tapped: false }
 }
 
 function triggerMatchesEvent(
@@ -242,9 +277,11 @@ function triggerMatchesEvent(
   sourcePlayerIndex: number,
   eventPlayerIndex: number,
   eventCard: Card | undefined,
-  counters: TurnCounters
+  counters: TurnCounters,
+  drawStepDraw = false
 ): boolean {
   if (tag.event !== event) return false
+  if (drawStepDraw && tag.qualifier === 'not-draw-step-draw') return false
   if (tag.spellNumber !== undefined) {
     // Ordinal tags (Esper Sentinel's "first spell", Lotho's "second spell",
     // or a manually-tagged "second card drawn" effect) must be checked
@@ -288,14 +325,15 @@ function triggerPromptForEvents(
   eventPlayerIndex: number,
   counters: TurnCounters,
   eventCard?: Card,
-  additionalSource?: PendingTrigger
+  additionalSource?: PendingTrigger,
+  drawStepDraw = false
 ): PendingTriggerPrompt | null {
   const triggers: PendingTrigger[] = []
   const seenCardIds = new Set<string>()
 
   const sourceTag = additionalSource?.sourceCard.triggerTag
   if (sourceTag && events.includes(sourceTag.event)
-    && triggerMatchesEvent(sourceTag, sourceTag.event, additionalSource!.controllerIndex, eventPlayerIndex, eventCard, counters)) {
+    && triggerMatchesEvent(sourceTag, sourceTag.event, additionalSource!.controllerIndex, eventPlayerIndex, eventCard, counters, drawStepDraw)) {
     triggers.push(additionalSource!)
     seenCardIds.add(additionalSource!.sourceCard.id)
   }
@@ -304,7 +342,7 @@ function triggerPromptForEvents(
     player.zones.battlefield.cards.forEach(card => {
       const tag = card.triggerTag
       if (!tag || seenCardIds.has(card.id) || !events.includes(tag.event)) return
-      if (!triggerMatchesEvent(tag, tag.event, playerIndex, eventPlayerIndex, eventCard, counters)) return
+      if (!triggerMatchesEvent(tag, tag.event, playerIndex, eventPlayerIndex, eventCard, counters, drawStepDraw)) return
       triggers.push({ sourceCard: { ...card }, controllerIndex: playerIndex, controller: player.name, event: tag.event })
       seenCardIds.add(card.id)
     })
@@ -474,6 +512,65 @@ function applyResolution(
       },
     })
   }
+}
+
+// drawCard and drawForTurn are the same draw — library to hand, draw counter,
+// draw triggers — except that a draw-for-turn is the turn-based draw-step
+// draw, which some triggers exclude.
+function drawFromLibrary(
+  playerIndex: number,
+  forTurn: boolean,
+  get: () => BuilderState,
+  set: (partial: Partial<BuilderState>) => void
+) {
+  const state = get()
+  if (!state.players) return
+  pushHistory(state)
+  const player = state.players[playerIndex]
+  const libCards = player.zones.library.cards
+  const libCount = player.zones.library.cardCount ?? libCards.length
+  if (libCount === 0) return
+
+  let drawnCard: Card
+  let newLibCards: Card[]
+  if (libCards.length > 0) {
+    drawnCard = libCards[libCards.length - 1]
+    newLibCards = libCards.slice(0, -1)
+  } else {
+    drawnCard = { id: `lib-${Date.now()}`, name: 'Card drawn from library', cardType: 'instant', faceDown: true }
+    newLibCards = []
+  }
+
+  const handCount = player.zones.hand.cardCount ?? player.zones.hand.cards.length
+  const updated = [...state.players] as [Player, Player, Player, Player]
+  updated[playerIndex] = {
+    ...player,
+    zones: {
+      ...player.zones,
+      library: { ...player.zones.library, cards: newLibCards, cardCount: Math.max(0, libCount - 1) },
+      hand: { ...player.zones.hand, cards: [...player.zones.hand.cards, drawnCard], cardCount: handCount + 1 },
+    },
+  }
+
+  if (!state.scenarioStarted) {
+    set({ players: updated })
+    return
+  }
+
+  const newCounters = cloneCounters(state.turnCounters)
+  newCounters.cardsDrawnThisTurn[playerIndex] += 1
+  // A draw-for-turn fires the same draw triggers as any other draw, except
+  // those tagged not-draw-step-draw (Orcish Bowmasters, Xyris, Leela).
+  const prompt = triggerPromptForEvents(
+    updated, ['opponent-draws', 'any-player-draws'], playerIndex, newCounters, undefined, undefined, forTurn
+  )
+
+  set({
+    players: updated,
+    turnCounters: newCounters,
+    pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
+    logLines: [...state.logLines, forTurn ? `${player.name} draws for the turn.` : `${player.name} draws a card.`],
+  })
 }
 
 let effectTokenSeq = 0
@@ -659,6 +756,12 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
   setCardsDrawnThisTurn: (playerIndex, count) => {
     const turnCounters = cloneCounters(get().turnCounters)
     turnCounters.cardsDrawnThisTurn[playerIndex] = Math.max(0, count)
+    set({ turnCounters })
+  },
+
+  setLandDropsThisTurn: (playerIndex, count) => {
+    const turnCounters = cloneCounters(get().turnCounters)
+    turnCounters.landDropsThisTurn[playerIndex] = Math.max(0, count)
     set({ turnCounters })
   },
 
@@ -933,7 +1036,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     if (!state.players) return
     pushHistory(state)
     const player = state.players[playerIndex]
-    const updatedCards = player.zones.battlefield.cards.map((c: Card) => ({ ...c, tapped: false }))
+    const updatedCards = player.zones.battlefield.cards.map(untapUnlessPinned)
     const updated = [...state.players] as [Player, Player, Player, Player]
     updated[playerIndex] = {
       ...player,
@@ -951,10 +1054,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     const nextIdx = (state.currentTurnPlayerIndex + 1) % 4
     const nextPlayer = state.players[nextIdx]
 
-    const currentHandCount = currentPlayer.zones.hand.cardCount ?? currentPlayer.zones.hand.cards.length
     const currentHandSize = state.handSizes[state.currentTurnPlayerIndex]
 
-    const untappedCards = nextPlayer.zones.battlefield.cards.map((c: Card) => ({ ...c, tapped: false }))
+    const untappedCards = nextPlayer.zones.battlefield.cards.map(untapUnlessPinned)
     const updated = [...state.players] as [Player, Player, Player, Player]
     updated[nextIdx] = {
       ...nextPlayer,
@@ -966,13 +1068,15 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       : state.turnNumber
 
     const newLogLines = [...state.logLines]
-    if (currentHandCount > currentHandSize) {
+    if (discardsToHandSize(currentPlayer, currentHandSize) > 0) {
       newLogLines.push(`${currentPlayer.name} must discard down to ${currentHandSize} cards.`)
     }
     newLogLines.push(`Turn ${newTurnNumber} — ${nextPlayer.name} untaps all permanents.`)
 
-    // Spells-cast and cards-drawn counters are whole-turn counters, not
-    // per-player-rotated — a new turn zeroes them for everyone.
+    // Spells-cast, cards-drawn, and land-drop counters are whole-turn
+    // counters, not per-player-rotated — a new turn zeroes them for everyone.
+    // The turn stops at upkeep: there is no draw here. The author may act in
+    // upkeep first, then uses Draw for Turn.
     const newCounters = cloneCounters(EMPTY_TURN_COUNTERS)
     const prompt = state.scenarioStarted ? triggerPromptForEvent(updated, 'your-upkeep', nextIdx, newCounters) : null
 
@@ -1023,9 +1127,11 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     const logLine = `${card.name} moves from ${player.name}'s ${ZONE_NAMES[fromZone]} to ${positionLabel}.`
 
     let prompt: PendingTriggerPrompt | null = null
+    let turnCounters = state.turnCounters
     if (state.scenarioStarted) {
       if (toZone === 'battlefield') {
         prompt = triggerPromptForEvent(updated, 'permanent-etb-yours', playerIndex, state.turnCounters)
+        turnCounters = withLandsEntered(turnCounters, playerIndex, [card])
       } else if (fromZone === 'battlefield' && toZone === 'graveyard' && card.cardType === 'creature') {
         prompt = triggerPromptForEvent(updated, 'creature-dies', playerIndex, state.turnCounters)
       }
@@ -1033,6 +1139,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
     set({
       players: updated,
+      turnCounters,
       pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
     })
@@ -1082,7 +1189,13 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
     const positionLabel = toZone === 'library' ? (position === 'bottom' ? 'bottom of library' : 'top of library') : ZONE_NAMES[toZone]
     const logLine = `All cards from ${player.name}'s ${ZONE_NAMES[fromZone]} move to ${positionLabel}.`
-    set({ players: updated, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+    set({
+      players: updated,
+      turnCounters: state.scenarioStarted && toZone === 'battlefield'
+        ? withLandsEntered(state.turnCounters, playerIndex, cleanCards)
+        : state.turnCounters,
+      logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
+    })
   },
 
   addCard: (playerIndex, zone, card) => {
@@ -1091,13 +1204,16 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     pushHistory(state)
 
     const player = state.players[playerIndex]
+    const turnCounters = state.scenarioStarted && zone === 'battlefield'
+      ? withLandsEntered(state.turnCounters, playerIndex, [card])
+      : state.turnCounters
 
     // Token stacking: increment existing same-name token instead of adding a new card
     if (card.isToken && zone === 'battlefield') {
       const result = stackExistingToken(state.players, playerIndex, card.name)
       if (result) {
         const logLine = `${player.name} creates another ${card.name} token (×${result.newCount}).`
-        set({ players: result.updated, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+        set({ players: result.updated, turnCounters, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
         return
       }
     }
@@ -1122,7 +1238,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     }
 
     const logLine = `${player.name} puts ${card.name} onto ${ZONE_NAMES[zone]}.`
-    set({ players: updated, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+    set({ players: updated, turnCounters, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
   },
 
   silentAddCard: (playerIndex, zone, card) => {
@@ -1191,11 +1307,14 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     const player = state.players[playerIndex]
     const source = player.zones.battlefield.cards.find((c: Card) => c.id === cardId)
     if (!source) return
+    const turnCounters = state.scenarioStarted
+      ? withLandsEntered(state.turnCounters, playerIndex, [source])
+      : state.turnCounters
 
     const result = stackExistingToken(state.players, playerIndex, source.name, cardId)
     if (result) {
       const logLine = `${player.name} creates another token copy of ${source.name} (×${result.newCount}).`
-      set({ players: result.updated, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+      set({ players: result.updated, turnCounters, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
       return
     }
 
@@ -1207,6 +1326,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     }
     set({
       players: updated,
+      turnCounters,
       logLines: state.scenarioStarted ? [...state.logLines, `${player.name} creates a token copy of ${source.name}.`] : state.logLines,
     })
   },
@@ -1229,6 +1349,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     }
     set({
       players: updated,
+      turnCounters: state.scenarioStarted ? withLandsEntered(state.turnCounters, playerIndex, [card]) : state.turnCounters,
       logLines: state.scenarioStarted ? [...state.logLines, `${player.name} creates another ${card.name} token (×${newCount}).`] : state.logLines,
     })
   },
@@ -1392,12 +1513,16 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       : `${item.sourceCardName} resolves and is put into the graveyard.`
 
     const controllerIndex = updated.findIndex(p => p.name === item.controller)
-    const prompt = (isPermanent && state.scenarioStarted && controllerIndex !== -1)
+    const entersBattlefield = isPermanent && state.scenarioStarted && controllerIndex !== -1
+    const prompt = entersBattlefield
       ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters)
       : null
 
     set({
       players: updated,
+      turnCounters: entersBattlefield
+        ? withLandsEntered(state.turnCounters, controllerIndex, [cardFromStackItem(item)])
+        : state.turnCounters,
       stack: state.stack.filter(s => s.id !== itemId),
       pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
@@ -1507,57 +1632,9 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     set({ players: updated })
   },
 
-  drawCard: (playerIndex) => {
-    const state = get()
-    if (!state.players) return
-    pushHistory(state)
-    const player = state.players[playerIndex]
-    const libCards = player.zones.library.cards
-    const libCount = player.zones.library.cardCount ?? libCards.length
-    if (libCount === 0) return
+  drawCard: (playerIndex) => drawFromLibrary(playerIndex, false, get, set),
 
-    let drawnCard: Card
-    let newLibCards: Card[]
-    if (libCards.length > 0) {
-      drawnCard = libCards[libCards.length - 1]
-      newLibCards = libCards.slice(0, -1)
-    } else {
-      drawnCard = { id: `lib-${Date.now()}`, name: 'Card drawn from library', cardType: 'instant', faceDown: true }
-      newLibCards = []
-    }
-
-    const handCount = player.zones.hand.cardCount ?? player.zones.hand.cards.length
-    const updated = [...state.players] as [Player, Player, Player, Player]
-    updated[playerIndex] = {
-      ...player,
-      zones: {
-        ...player.zones,
-        library: { ...player.zones.library, cards: newLibCards, cardCount: Math.max(0, libCount - 1) },
-        hand: { ...player.zones.hand, cards: [...player.zones.hand.cards, drawnCard], cardCount: handCount + 1 },
-      },
-    }
-
-    if (!state.scenarioStarted) {
-      set({ players: updated })
-      return
-    }
-
-    const newCounters = cloneCounters(state.turnCounters)
-    newCounters.cardsDrawnThisTurn[playerIndex] += 1
-    // Known limitation: this fires on every draw, including the ordinary
-    // turn-based draw — there is no separate drawForTurn action, so a card
-    // like Orcish Bowmasters ("except the first one they draw in each of
-    // their draw steps") will over-trigger here. The author dismisses the
-    // extra prompt; see lib/triggerDetection.ts for the matching note.
-    const prompt = triggerPromptForEvents(updated, ['opponent-draws', 'any-player-draws'], playerIndex, newCounters)
-
-    set({
-      players: updated,
-      turnCounters: newCounters,
-      pendingTriggerPrompt: mergeTriggerPrompt(state.pendingTriggerPrompt, prompt),
-      logLines: [...state.logLines, `${player.name} draws a card.`],
-    })
-  },
+  drawForTurn: (playerIndex) => drawFromLibrary(playerIndex, true, get, set),
 
   shuffleLibrary: (playerIndex) => {
     const state = get()

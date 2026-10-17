@@ -73,6 +73,21 @@ describe('detectTriggerTag — ordinal draw triggers ("second card each turn")',
   })
 })
 
+describe('detectTriggerTag — "except the first one they draw in each of their draw steps"', () => {
+  it.each([
+    ['Orcish Bowmasters', 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.', undefined],
+    ['Xyris, the Writhing Storm', 'Flying\nWhenever an opponent draws a card except the first one they draw in each of their draw steps, create a 1/1 green Snake creature token.\nWhenever Xyris deals combat damage to a player, you and that player each draw that many cards.', { kind: 'createToken', count: 1, tokenName: '1/1 green Snake creature' }],
+    ['Leela, Sevateem Warrior', "Whenever an opponent draws a card except the first one they draw in each of their draw steps, put a +1/+1 counter on Leela.\nDoctor's companion (You can have two commanders if the other is the Doctor.)", undefined],
+  ])('%s -> opponent-draws excluding the draw-step draw', (_name, text, effect) => {
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', qualifier: 'not-draw-step-draw', ...(effect && { effect }) })
+  })
+
+  it('a plain opponent-draws trigger has no draw-step exception (Smothering Tithe)', () => {
+    const text = `Whenever an opponent draws a card, that player may pay {2}. If the player doesn't, you create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`
+    expect(detectTriggerTag(text)?.qualifier).toBeUndefined()
+  })
+})
+
 describe('detectTriggerTag — "a player" triggers include the controller (any-player-draws / any-player-casts)', () => {
   it("King T'Challa's front face -> any-player-draws with ordinal 2 and a draw-1 effect", () => {
     const text = "Flash\nWhenever a player draws their second card each turn, you draw a card.\n{4}{W}{U}: Transform King T'Challa. Activate only as a sorcery."
@@ -210,9 +225,9 @@ describe('detectTriggerTag — replacement effects are not triggers (CR 614.1d)'
 })
 
 describe('detectTriggerTag — priority order', () => {
-  it('Orcish Bowmasters matches both an ETB clause and an opponent-draws clause; opponent-draws is checked first and wins (known limitation, see Task 5 / lib/triggerDetection.ts)', () => {
+  it('Orcish Bowmasters matches both an ETB clause and an opponent-draws clause; opponent-draws is checked first and wins, carrying its draw-step exception', () => {
     const text = 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.'
-    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', qualifier: 'not-draw-step-draw' })
   })
 })
 
@@ -278,7 +293,7 @@ describe('trigger effects — parsed from the trigger\'s own paragraph, verbatim
 
   it('effects the builder does not model get no effect: damage (Orcish Bowmasters), life (Blood Artist)', () => {
     const bowmasters = 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.'
-    expect(detectTriggerTag(bowmasters)).toEqual({ event: 'opponent-draws' })
+    expect(detectTriggerTag(bowmasters)).toEqual({ event: 'opponent-draws', qualifier: 'not-draw-step-draw' })
     expect(detectTriggerTag('Whenever this creature or another creature dies, target player loses 1 life and you gain 1 life.'))
       .toEqual({ event: 'creature-dies' })
   })

@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import Image from 'next/image'
-import { useBuilderStore, type ScenarioStep, type DecisionChoice } from '@/store/builderStore'
+import { useBuilderStore, discardsToHandSize, type ScenarioStep, type DecisionChoice } from '@/store/builderStore'
 import styles from './ActionLog.module.css'
 
 type Quality = 'best' | 'ok' | 'blunder'
@@ -56,10 +56,8 @@ export function ActionLog() {
   function handlePassTurn() {
     if (!players) return
     const currentPlayer = players[currentTurnPlayerIndex]
-    const handCount = currentPlayer.zones.hand.cardCount ?? currentPlayer.zones.hand.cards.length
-    const handSize = handSizes[currentTurnPlayerIndex]
 
-    if (handCount > handSize && currentPlayer.zones.hand.cards.length > 0) {
+    if (discardsToHandSize(currentPlayer, handSizes[currentTurnPlayerIndex]) > 0 && currentPlayer.zones.hand.cards.length > 0) {
       setShowDiscardModal(true)
     } else {
       passTurn()
@@ -74,6 +72,14 @@ export function ActionLog() {
   function handleDiscardDone() {
     setShowDiscardModal(false)
     passTurn()
+  }
+
+  // Discarding to hand size is a turn-based action; if it triggers anything,
+  // the active player gets priority before the turn ends (CR 514.1, 514.3a).
+  // This stays on the current turn so the author can put those triggers on
+  // the stack. Pass Turn afterwards finds the hand at size and just passes.
+  function handleDiscardOnly() {
+    setShowDiscardModal(false)
   }
 
   function resetSaveModal() {
@@ -140,11 +146,7 @@ export function ActionLog() {
 
   const playerNames = players?.map(p => p.name) ?? ['Player', 'Opponent 1', 'Opponent 2', 'Opponent 3']
   const currentPlayer = players?.[currentTurnPlayerIndex]
-  const currentHandSize = handSizes[currentTurnPlayerIndex]
-  const currentHandCount = currentPlayer
-    ? (currentPlayer.zones.hand.cardCount ?? currentPlayer.zones.hand.cards.length)
-    : 0
-  const discardCount = Math.max(0, currentHandCount - currentHandSize)
+  const discardCount = currentPlayer ? discardsToHandSize(currentPlayer, handSizes[currentTurnPlayerIndex]) : 0
 
   const discardModal = showDiscardModal && currentPlayer && createPortal(
     <div className={styles.discardBackdrop} onClick={e => e.stopPropagation()}>
@@ -188,11 +190,19 @@ export function ActionLog() {
             Skip cleanup
           </button>
           <button
+            className={styles.discardOnlyBtn}
+            onClick={handleDiscardOnly}
+            disabled={discardCount > 0}
+            title="Stay on this turn to put discard triggers on the stack"
+          >
+            Discard only
+          </button>
+          <button
             className={styles.discardDoneBtn}
             onClick={handleDiscardDone}
             disabled={discardCount > 0}
           >
-            {discardCount > 0 ? `Discard ${discardCount} more` : 'Done'}
+            {discardCount > 0 ? `Discard ${discardCount} more` : 'Discard and pass turn'}
           </button>
         </div>
       </div>

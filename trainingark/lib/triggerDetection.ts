@@ -70,11 +70,25 @@ function spellOrdinal(oracleText: string): number | undefined {
 
 // Faerie Mastermind and Gleaming Splendor: "draws their second card each
 // turn". Bowmasters' "except the first one they draw in each of their draw
-// steps" deliberately does not match — it is not a simple ordinal.
+// steps" deliberately does not match — it is not a simple ordinal; see
+// drawTag.
 function drawOrdinal(oracleText: string): number | undefined {
   if (/\bdraws\s+their\s+first\s+card\s+each\s+turn/i.test(oracleText)) return 1
   if (/\bdraws\s+their\s+second\s+card\s+each\s+turn/i.test(oracleText)) return 2
   return undefined
+}
+
+// Orcish Bowmasters, Xyris, the Writhing Storm, and Leela, Sevateem Warrior
+// exclude "the first one they draw in each of their draw steps" — the
+// turn-based draw, which the author records with drawForTurn.
+function drawTag(event: 'opponent-draws' | 'any-player-draws', oracleText: string): TriggerTag {
+  const ordinal = drawOrdinal(oracleText)
+  const exceptDrawStep = /\bexcept the first one they draw in each of their draw steps\b/i.test(oracleText)
+  return {
+    event,
+    ...(ordinal !== undefined && { spellNumber: ordinal }),
+    ...(exceptDrawStep && { qualifier: 'not-draw-step-draw' as const }),
+  }
 }
 
 function detectTriggerEvent(oracleText: string): { tag: TriggerTag, index: number } | undefined {
@@ -108,18 +122,13 @@ function detectTriggerEvent(oracleText: string): { tag: TriggerTag, index: numbe
   if (found(/whenever you cast a noncreature spell/i)) {
     return { index, tag: { event: 'you-cast-noncreature', qualifier: 'noncreature' } }
   }
-  // Known limitation: Orcish Bowmasters is intentionally tagged here even
-  // though draw-for-turn is not modelled yet, so its draw-step exception is
-  // left for the author to dismiss.
   if (found(/whenever an opponent draws/i)) {
-    const ordinal = drawOrdinal(oracleText)
-    return { index, tag: ordinal === undefined ? { event: 'opponent-draws' } : { event: 'opponent-draws', spellNumber: ordinal } }
+    return { index, tag: drawTag('opponent-draws', oracleText) }
   }
   // King T'Challa. Same strictness as any-player-casts: The Council of Four's
   // "second card during their turn" is not a plain ordinal.
   if (found(/whenever a player draws (?:a card|their (?:first|second) card each turn), (?!if\b)/i)) {
-    const ordinal = drawOrdinal(oracleText)
-    return { index, tag: ordinal === undefined ? { event: 'any-player-draws' } : { event: 'any-player-draws', spellNumber: ordinal } }
+    return { index, tag: drawTag('any-player-draws', oracleText) }
   }
   if (found(/when(?:ever)?\s+[^.\n]{0,120}\benters(?:\s+the battlefield)?\b/i)) {
     return { index, tag: { event: 'permanent-etb-yours' } }

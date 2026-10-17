@@ -83,11 +83,11 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const {
     players, updatePlayer, confirmSetup, setupComplete,
     moveCard, moveAllCards, addCard, castToStack, setLife, setTax, setTaxPartner,
-    decklists, drawCard, shuffleLibrary, removeCard, createTokenCopy,
+    decklists, drawCard, drawForTurn, shuffleLibrary, removeCard, createTokenCopy,
     incrementToken, decrementToken, toggleTapped, toggleRevealed,
     toggleDoesNotUntap, setTriggerTag,
     handSizes, setHandSize,
-    turnCounters, setSpellsCastThisTurn, setCardsDrawnThisTurn,
+    turnCounters, setSpellsCastThisTurn, setCardsDrawnThisTurn, setLandDropsThisTurn,
     isDuplicate, dismissDuplicateWarning, dismissedDuplicateWarnings,
     populateLibrary, librarySearch, closeLibrarySearch,
   } = useBuilderStore()
@@ -111,6 +111,8 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
   const [spellsCastInput, setSpellsCastInput] = useState('')
   const [editingCardsDrawn, setEditingCardsDrawn] = useState(false)
   const [cardsDrawnInput, setCardsDrawnInput] = useState('')
+  const [editingLandDrops, setEditingLandDrops] = useState(false)
+  const [landDropsInput, setLandDropsInput] = useState('')
   const [zoneMenu, setZoneMenu] = useState<{ x: number; y: number; items: ZoneMenuItem[] } | null>(null)
   const [editPoolLoading, setEditPoolLoading] = useState(false)
   const [showEditPool, setShowEditPool] = useState(false)
@@ -285,6 +287,12 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
     setEditingCardsDrawn(false)
   }
 
+  function commitLandDrops() {
+    const val = parseInt(landDropsInput)
+    if (!isNaN(val)) setLandDropsThisTurn(playerIndex, val)
+    setEditingLandDrops(false)
+  }
+
   function commitHandSize() {
     const val = parseInt(handSizeInput)
     if (!isNaN(val) && val > 0) setHandSize(playerIndex, val)
@@ -337,6 +345,10 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
       { label: 'Search Library', action: () => toggle('library') },
       { label: 'Shuffle Library', action: () => shuffleLibrary(playerIndex) },
       { label: 'Draw', action: () => drawCard(playerIndex) },
+      // The turn-based draw. Plain Draw is for every other draw (upkeep
+      // triggers, cantrips, Rhystic Study) — only this one is excluded by
+      // "except the first one they draw in each of their draw steps".
+      { label: 'Draw for Turn', action: () => drawForTurn(playerIndex) },
       {
         label: 'Add Token', action: () => {
           const rect = addBtnRef.current?.getBoundingClientRect()
@@ -808,6 +820,25 @@ export function PlayerZone({ playerIndex, position, revealAll, viewMode, playerO
           title="Click to edit — cards drawn this turn"
         >
           Drawn: {turnCounters.cardsDrawnThisTurn[playerIndex]}
+        </span>
+      ))}
+      {!viewMode && (editingLandDrops ? (
+        <input
+          className={styles.inlineInput}
+          type="number"
+          value={landDropsInput}
+          onChange={e => setLandDropsInput(e.target.value)}
+          onBlur={commitLandDrops}
+          onKeyDown={e => { if (e.key === 'Enter') commitLandDrops(); if (e.key === 'Escape') setEditingLandDrops(false) }}
+          autoFocus
+        />
+      ) : (
+        <span
+          className={styles.playerHandSize}
+          onClick={() => { setLandDropsInput(String(turnCounters.landDropsThisTurn[playerIndex])); setEditingLandDrops(true) }}
+          title="Click to edit — lands that entered the battlefield this turn"
+        >
+          Lands: {turnCounters.landDropsThisTurn[playerIndex]}
         </span>
       ))}
     </div>

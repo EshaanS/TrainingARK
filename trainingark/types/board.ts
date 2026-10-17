@@ -31,9 +31,12 @@ export type TriggerEffect =
 
 export interface TriggerTag {
   event: EventType
-  // any-player-casts carries its noncreature restriction here; the
-  // opponent-scoped cast events encode it in the event type instead.
-  qualifier?: 'noncreature'
+  // Narrows which events match. any-player-casts carries its noncreature
+  // restriction here (the opponent-scoped cast events encode it in the event
+  // type instead). 'not-draw-step-draw' is Orcish Bowmasters' "except the
+  // first one they draw in each of their draw steps": a drawForTurn draw does
+  // not match, every other draw does.
+  qualifier?: 'noncreature' | 'not-draw-step-draw'
   // Some triggered abilities contain a simple ordinal condition. This is a
   // suggestion gate only: authors can always add the ability manually.
   // Despite the name, for opponent-draws it is the nth card drawn this turn.
@@ -54,6 +57,9 @@ export interface TurnCounters {
   spellsCastThisTurn: [number, number, number, number]
   totalSpellsCastThisTurn: number
   cardsDrawnThisTurn: [number, number, number, number]
+  // Informational only: every land that reaches a battlefield counts, however
+  // it got there, and nothing enforces a limit.
+  landDropsThisTurn: [number, number, number, number]
 }
 
 export interface Card {
