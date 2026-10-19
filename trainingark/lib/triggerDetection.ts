@@ -91,6 +91,23 @@ function drawTag(event: 'opponent-draws' | 'any-player-draws', oracleText: strin
   }
 }
 
+// An ETB trigger that watches other permanents always quantifies what it
+// watches: "Whenever a creature you control enters" (Impact Tremors),
+// "another creature" (Soul Warden), "another creature you control"
+// (Purphoros), "a land you control" (landfall), "your commander" (Tome of
+// Legends). One about the card itself names it: "When this creature enters"
+// (Mulldrifter, Eternal Witness, Thassa's Oracle), the card's name or short
+// name ("When The One Ring enters", "Whenever Korvold enters or attacks"), or
+// "when it enters" (ravenous, gift). Checked against every Commander-legal
+// ETB trigger on Scryfall. "This creature or another Ally you control" is a
+// watcher: it also fires on others.
+const WATCHES_OTHERS = /\b(?:a|an|another|other|one or more|two or more|each|any|your|that|enchanted|equipped)\b|\byou control\b|\bunder\b/i
+
+function etbTag(clause: string): TriggerTag {
+  const subject = /^when(?:ever)?\s+([^.\n]{0,120}?)\s+enters\b/i.exec(clause)?.[1] ?? ''
+  return WATCHES_OTHERS.test(subject) ? { event: 'permanent-etb-yours' } : { event: 'permanent-etb-yours', qualifier: 'self' }
+}
+
 function detectTriggerEvent(oracleText: string): { tag: TriggerTag, index: number } | undefined {
   let index = -1
   const found = (pattern: RegExp) => (index = usableMatchIndex(oracleText, pattern)) !== -1
@@ -131,7 +148,7 @@ function detectTriggerEvent(oracleText: string): { tag: TriggerTag, index: numbe
     return { index, tag: drawTag('any-player-draws', oracleText) }
   }
   if (found(/when(?:ever)?\s+[^.\n]{0,120}\benters(?:\s+the battlefield)?\b/i)) {
-    return { index, tag: { event: 'permanent-etb-yours' } }
+    return { index, tag: etbTag(oracleText.slice(index)) }
   }
   if (found(/whenever an opponent searches/i)) {
     return { index, tag: { event: 'opponent-searches' } }
@@ -193,6 +210,27 @@ export function detectTriggerTag(oracleText?: string): TriggerTag | undefined {
   if (!detected) return undefined
   const effect = detectTriggerEffect(effectTextAt(oracleText, detected.index))
   return effect ? { ...detected.tag, effect } : detected.tag
+}
+
+const CAST_EVENTS = new Set<EventType>(['opponent-casts', 'opponent-casts-noncreature', 'any-player-casts', 'you-cast-noncreature'])
+const DRAW_EVENTS = new Set<EventType>(['opponent-draws', 'any-player-draws'])
+
+// Re-tagging from the context menu corrects WHEN the ability triggers. What
+// it does on resolution (effect) and what its trigger excludes (qualifier)
+// were parsed from the card and carry over, except a qualifier the new event
+// cannot use: 'noncreature' only narrows casts, 'not-draw-step-draw' only
+// narrows draws, 'self' only narrows ETB. The ordinal is dropped, since it
+// counted the old event.
+export function retagTrigger(tag: TriggerTag | undefined, event: EventType): TriggerTag {
+  const qualifier = tag?.qualifier
+  const keepQualifier = (qualifier === 'noncreature' && CAST_EVENTS.has(event))
+    || (qualifier === 'not-draw-step-draw' && DRAW_EVENTS.has(event))
+    || (qualifier === 'self' && event === 'permanent-etb-yours')
+  return {
+    event,
+    ...(keepQualifier && { qualifier }),
+    ...(tag?.effect && { effect: tag.effect }),
+  }
 }
 
 // "If you would draw a card ..." (Alhammarret's Archive), "If an opponent

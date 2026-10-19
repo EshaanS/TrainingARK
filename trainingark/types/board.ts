@@ -35,8 +35,10 @@ export interface TriggerTag {
   // restriction here (the opponent-scoped cast events encode it in the event
   // type instead). 'not-draw-step-draw' is Orcish Bowmasters' "except the
   // first one they draw in each of their draw steps": a drawForTurn draw does
-  // not match, every other draw does.
-  qualifier?: 'noncreature' | 'not-draw-step-draw'
+  // not match, every other draw does. 'self' is an ETB trigger about the card
+  // itself (Mulldrifter's "When this creature enters"): it matches only that
+  // card entering, never another permanent.
+  qualifier?: 'noncreature' | 'not-draw-step-draw' | 'self'
   // Some triggered abilities contain a simple ordinal condition. This is a
   // suggestion gate only: authors can always add the ability manually.
   // Despite the name, for opponent-draws it is the nth card drawn this turn.

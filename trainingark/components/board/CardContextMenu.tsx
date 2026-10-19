@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom'
 import styles from './CardContextMenu.module.css'
 import type { EditableZone } from '@/store/builderStore'
 import type { Card, TriggerTag } from '@/types/board'
-import { EVENT_TYPE_LABELS } from '@/lib/triggerDetection'
+import { EVENT_TYPE_LABELS, retagTrigger } from '@/lib/triggerDetection'
 
 export type ZoneTarget =
   | 'battlefield'
@@ -87,9 +87,9 @@ export function CardContextMenu({
       </button>
       <div className={styles.menuDivider} />
       {(Object.entries(EVENT_TYPE_LABELS) as [TriggerTag['event'], string][]).map(([event, label]) => (
-        // Re-tagging corrects WHEN the ability triggers; what it does when it
-        // resolves was parsed from the card and is kept.
-        <button key={event} className={styles.menuItem} onClick={() => { onSetTriggerTag?.({ event, ...(triggerTag?.effect && { effect: triggerTag.effect }) }); onClose() }}>
+        // Re-tagging corrects WHEN the ability triggers; see retagTrigger for
+        // what carries over from the parsed tag.
+        <button key={event} className={styles.menuItem} onClick={() => { onSetTriggerTag?.(retagTrigger(triggerTag, event)); onClose() }}>
           {label}
         </button>
       ))}

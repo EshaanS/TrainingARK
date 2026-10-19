@@ -255,6 +255,26 @@ function withLandsEntered(counters: TurnCounters, playerIndex: number, cards: Ca
   return next
 }
 
+// The pending prompt after cards enter a player's battlefield: their
+// permanent-etb-yours triggers, merged into whatever is already pending. One
+// scan covers a bulk move, so each watcher is offered once however many
+// cards entered. Tokens are permanents entering too, as the land-drop
+// counter already treats them. A 'self' tag (Mulldrifter) is offered only
+// when its own card is one of those that entered; `enteredIds` are the ids
+// on the battlefield afterwards, so a token stacking onto an existing token
+// passes that stack's id.
+function promptAfterEntering(
+  state: BuilderState,
+  players: [Player, Player, Player, Player],
+  playerIndex: number,
+  enteredIds: string[]
+): PendingTriggerPrompt | null {
+  if (!state.scenarioStarted) return state.pendingTriggerPrompt
+  const prompt = triggerPromptForEvent(players, 'permanent-etb-yours', playerIndex, state.turnCounters)
+  const triggers = prompt?.triggers.filter(t => t.sourceCard.triggerTag?.qualifier !== 'self' || enteredIds.includes(t.sourceCard.id)) ?? []
+  return mergeTriggerPrompt(state.pendingTriggerPrompt, triggers.length > 0 ? { ...prompt!, triggers } : null)
+}
+
 // Cards a player must discard in cleanup to get down to their hand size. The
 // Pass Turn button opens the discard modal when this is above zero, and
 // returns to a plain pass once the author has discarded down, which is how
@@ -669,7 +689,7 @@ function stackExistingToken(
   playerIndex: number,
   tokenName: string,
   excludeCardId?: string
-): { updated: [Player, Player, Player, Player]; newCount: number } | null {
+): { updated: [Player, Player, Player, Player]; newCount: number; cardId: string } | null {
   const player = players[playerIndex]
   const existingIdx = player.zones.battlefield.cards.findIndex(
     c => c.isToken && c.name === tokenName && c.id !== excludeCardId
@@ -683,7 +703,7 @@ function stackExistingToken(
     ...player,
     zones: { ...player.zones, battlefield: { ...player.zones.battlefield, cards: updatedCards } },
   }
-  return { updated, newCount }
+  return { updated, newCount, cardId: updatedCards[existingIdx].id }
 }
 
 export const useBuilderStore = create<BuilderState>((set, get) => ({
@@ -1126,21 +1146,21 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     const positionLabel = toZone === 'library' ? (position === 'bottom' ? 'bottom of library' : 'top of library') : ZONE_NAMES[toZone]
     const logLine = `${card.name} moves from ${player.name}'s ${ZONE_NAMES[fromZone]} to ${positionLabel}.`
 
-    let prompt: PendingTriggerPrompt | null = null
+    let pendingTriggerPrompt = state.pendingTriggerPrompt
     let turnCounters = state.turnCounters
     if (state.scenarioStarted) {
       if (toZone === 'battlefield') {
-        prompt = triggerPromptForEvent(updated, 'permanent-etb-yours', playerIndex, state.turnCounters)
+        pendingTriggerPrompt = promptAfterEntering(state, updated, playerIndex, [card.id])
         turnCounters = withLandsEntered(turnCounters, playerIndex, [card])
       } else if (fromZone === 'battlefield' && toZone === 'graveyard' && card.cardType === 'creature') {
-        prompt = triggerPromptForEvent(updated, 'creature-dies', playerIndex, state.turnCounters)
+        pendingTriggerPrompt = mergeTriggerPrompt(pendingTriggerPrompt, triggerPromptForEvent(updated, 'creature-dies', playerIndex, state.turnCounters))
       }
     }
 
     set({
       players: updated,
       turnCounters,
-      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
+      pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
     })
   },
@@ -1194,6 +1214,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       turnCounters: state.scenarioStarted && toZone === 'battlefield'
         ? withLandsEntered(state.turnCounters, playerIndex, cleanCards)
         : state.turnCounters,
+      pendingTriggerPrompt: toZone === 'battlefield' ? promptAfterEntering(state, updated, playerIndex, cleanCards.map(c => c.id)) : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
     })
   },
@@ -1213,7 +1234,12 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
       const result = stackExistingToken(state.players, playerIndex, card.name)
       if (result) {
         const logLine = `${player.name} creates another ${card.name} token (×${result.newCount}).`
-        set({ players: result.updated, turnCounters, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+        set({
+          players: result.updated,
+          turnCounters,
+          pendingTriggerPrompt: promptAfterEntering(state, result.updated, playerIndex, [result.cardId]),
+          logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
+        })
         return
       }
     }
@@ -1238,7 +1264,12 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     }
 
     const logLine = `${player.name} puts ${card.name} onto ${ZONE_NAMES[zone]}.`
-    set({ players: updated, turnCounters, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+    set({
+      players: updated,
+      turnCounters,
+      pendingTriggerPrompt: zone === 'battlefield' ? promptAfterEntering(state, updated, playerIndex, [card.id]) : state.pendingTriggerPrompt,
+      logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
+    })
   },
 
   silentAddCard: (playerIndex, zone, card) => {
@@ -1314,7 +1345,12 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     const result = stackExistingToken(state.players, playerIndex, source.name, cardId)
     if (result) {
       const logLine = `${player.name} creates another token copy of ${source.name} (×${result.newCount}).`
-      set({ players: result.updated, turnCounters, logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines })
+      set({
+        players: result.updated,
+        turnCounters,
+        pendingTriggerPrompt: promptAfterEntering(state, result.updated, playerIndex, [result.cardId]),
+        logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
+      })
       return
     }
 
@@ -1327,6 +1363,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     set({
       players: updated,
       turnCounters,
+      pendingTriggerPrompt: promptAfterEntering(state, updated, playerIndex, [tokenCopy.id]),
       logLines: state.scenarioStarted ? [...state.logLines, `${player.name} creates a token copy of ${source.name}.`] : state.logLines,
     })
   },
@@ -1350,6 +1387,7 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
     set({
       players: updated,
       turnCounters: state.scenarioStarted ? withLandsEntered(state.turnCounters, playerIndex, [card]) : state.turnCounters,
+      pendingTriggerPrompt: promptAfterEntering(state, updated, playerIndex, [card.id]),
       logLines: state.scenarioStarted ? [...state.logLines, `${player.name} creates another ${card.name} token (×${newCount}).`] : state.logLines,
     })
   },
@@ -1507,24 +1545,24 @@ export const useBuilderStore = create<BuilderState>((set, get) => ({
 
     const isPermanent = item.cardType ? PERMANENT_TYPES.has(item.cardType) : false
     const zone = isPermanent ? 'battlefield' : 'graveyard'
-    const updated = placeCardInZone(state.players, item.controller, zone, cardFromStackItem(item))
+    const resolved = cardFromStackItem(item)
+    const updated = placeCardInZone(state.players, item.controller, zone, resolved)
     const logLine = isPermanent
       ? `${item.sourceCardName} resolves onto the battlefield.`
       : `${item.sourceCardName} resolves and is put into the graveyard.`
 
     const controllerIndex = updated.findIndex(p => p.name === item.controller)
     const entersBattlefield = isPermanent && state.scenarioStarted && controllerIndex !== -1
-    const prompt = entersBattlefield
-      ? triggerPromptForEvent(updated, 'permanent-etb-yours', controllerIndex, state.turnCounters)
-      : null
 
     set({
       players: updated,
       turnCounters: entersBattlefield
-        ? withLandsEntered(state.turnCounters, controllerIndex, [cardFromStackItem(item)])
+        ? withLandsEntered(state.turnCounters, controllerIndex, [resolved])
         : state.turnCounters,
       stack: state.stack.filter(s => s.id !== itemId),
-      pendingTriggerPrompt: prompt ? mergeTriggerPrompt(state.pendingTriggerPrompt, prompt) : state.pendingTriggerPrompt,
+      pendingTriggerPrompt: entersBattlefield
+        ? promptAfterEntering(state, updated, controllerIndex, [resolved.id])
+        : state.pendingTriggerPrompt,
       logLines: state.scenarioStarted ? [...state.logLines, logLine] : state.logLines,
     })
     applyResolution(item, get, set)

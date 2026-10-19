@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { detectTriggerTag, detectStormGrant, detectCardMetadata, detectSearchesLibrary, detectTriggerEffect, detectCountReplacements } from './triggerDetection'
+import { detectTriggerTag, detectStormGrant, detectCardMetadata, detectSearchesLibrary, detectTriggerEffect, detectCountReplacements, retagTrigger } from './triggerDetection'
 
 // Oracle text below is verbatim from Scryfall (fetched while writing these
 // tests), not paraphrased, since the parser is sensitive to exact phrasing.
@@ -35,9 +35,9 @@ describe('detectTriggerTag — one case per event, using real oracle text', () =
     expect(detectTriggerTag(text)).toEqual({ event: 'opponent-draws', effect: { kind: 'createToken', count: 1, tokenName: 'Treasure' } })
   })
 
-  it('Mulldrifter -> permanent-etb-yours', () => {
+  it('Mulldrifter -> permanent-etb-yours, about itself only', () => {
     const text = `Flying\nWhen this creature enters, draw two cards.\nEvoke {2}{U} (You may cast this spell for its evoke cost. If you do, it's sacrificed when it enters.)`
-    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours', effect: { kind: 'draw', count: 2 } })
+    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours', qualifier: 'self', effect: { kind: 'draw', count: 2 } })
   })
 
   it('Archivist of Oghma -> opponent-searches', () => {
@@ -152,7 +152,7 @@ describe('quoted text is never the card\'s own ability — one guard for every d
 
   it('a quoted draw inside a trigger\'s effect is not that trigger\'s effect (Sygg grants "... draw a card")', () => {
     const text = 'Sygg can\'t be blocked.\nWhenever this creature enters or transforms into Sygg, Wanderwine Wisdom, target creature gains "Whenever this creature deals combat damage to a player or planeswalker, draw a card" until end of turn.\nAt the beginning of your first main phase, you may pay {W}. If you do, transform Sygg.'
-    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours', qualifier: 'self' })
   })
 
   it("a search in an emblem is not the planeswalker's own search (Tezzeret, Artifice Master)", () => {
@@ -207,7 +207,7 @@ describe('detectSearchesLibrary — cards that search their controller\'s librar
 describe('detectTriggerTag — replacement effects are not triggers (CR 614.1d)', () => {
   it('Temple of Mystery: "enters tapped" alone is excluded, but the real "When this land enters" trigger on the same card still matches', () => {
     const text = `This land enters tapped.\nWhen this land enters, scry 1. (Look at the top card of your library. You may put that card on the bottom.)\n{T}: Add {G} or {U}.`
-    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours' })
+    expect(detectTriggerTag(text)).toEqual({ event: 'permanent-etb-yours', qualifier: 'self' })
   })
 
   it('Walking Ballista: "enters with X counters", with no When/Whenever anywhere in the text, produces no trigger tag at all', () => {
@@ -330,5 +330,78 @@ describe('detectCountReplacements — verbatim Scryfall text', () => {
   it('Opposition Agent and Rhystic Study have none, and detectCardMetadata stores the list only when non-empty', () => {
     expect(detectCountReplacements("Flash\nYou control your opponents while they're searching their libraries.\nWhile an opponent is searching their library, they exile each card they find. You may play those cards for as long as they remain exiled, and you may spend mana as though it were mana of any color to cast them.")).toEqual([])
     expect(detectCardMetadata('Whenever an opponent casts a spell, you may draw a card unless that player pays {1}.')).not.toHaveProperty('countReplacements')
+  })
+})
+
+describe('retagTrigger — what a context-menu re-tag keeps from the parsed tag (verbatim Scryfall text)', () => {
+  const RURIC_THAR = 'Reach, vigilance\nRuric Thar attacks each combat if able.\nWhenever a player casts a noncreature spell, Ruric Thar deals 6 damage to that player.'
+  const ORCISH_BOWMASTERS = 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.'
+  const ESPER_SENTINEL = "Whenever an opponent casts their first noncreature spell each turn, draw a card unless that player pays {X}, where X is this creature's power."
+
+  it('keeps the noncreature qualifier on every cast event (Ruric Thar)', () => {
+    const tag = detectTriggerTag(RURIC_THAR)
+    for (const event of ['any-player-casts', 'opponent-casts', 'opponent-casts-noncreature', 'you-cast-noncreature'] as const) {
+      expect(retagTrigger(tag, event)).toEqual({ event, qualifier: 'noncreature' })
+    }
+  })
+
+  it('keeps the draw-step exception on both draw events (Orcish Bowmasters)', () => {
+    const tag = detectTriggerTag(ORCISH_BOWMASTERS)
+    expect(retagTrigger(tag, 'any-player-draws')).toEqual({ event: 'any-player-draws', qualifier: 'not-draw-step-draw' })
+    expect(retagTrigger(tag, 'opponent-draws')).toEqual({ event: 'opponent-draws', qualifier: 'not-draw-step-draw' })
+  })
+
+  it('drops a qualifier the new event cannot use: noncreature off a cast event, the draw-step exception off a draw event', () => {
+    expect(retagTrigger(detectTriggerTag(RURIC_THAR), 'opponent-draws')).toEqual({ event: 'opponent-draws' })
+    expect(retagTrigger(detectTriggerTag(RURIC_THAR), 'permanent-etb-yours')).toEqual({ event: 'permanent-etb-yours' })
+    // Bowmasters' other trigger is an ETB, the likeliest re-tag for it.
+    expect(retagTrigger(detectTriggerTag(ORCISH_BOWMASTERS), 'permanent-etb-yours')).toEqual({ event: 'permanent-etb-yours' })
+    expect(retagTrigger(detectTriggerTag(ORCISH_BOWMASTERS), 'opponent-casts')).toEqual({ event: 'opponent-casts' })
+  })
+
+  it('keeps the effect and qualifier together and still drops the ordinal (Esper Sentinel)', () => {
+    const tag = detectTriggerTag(ESPER_SENTINEL)
+    expect(tag).toMatchObject({ spellNumber: 1, qualifier: 'noncreature', effect: { kind: 'draw', count: 1 } })
+    expect(retagTrigger(tag, 'any-player-casts')).toEqual({ event: 'any-player-casts', qualifier: 'noncreature', effect: { kind: 'draw', count: 1 } })
+    expect(retagTrigger(tag, 'opponent-draws')).toEqual({ event: 'opponent-draws', effect: { kind: 'draw', count: 1 } })
+  })
+
+  it('tagging a card that had no tag gives just the event', () => {
+    expect(retagTrigger(undefined, 'your-upkeep')).toEqual({ event: 'your-upkeep' })
+  })
+})
+
+describe('detectTriggerTag — an ETB about the card itself vs. one watching other permanents (verbatim Scryfall text)', () => {
+  it.each([
+    ['Mulldrifter', "Flying\nWhen this creature enters, draw two cards.\nEvoke {2}{U} (You may cast this spell for its evoke cost. If you do, it's sacrificed when it enters.)"],
+    ['Eternal Witness', 'When this creature enters, you may return target card from your graveyard to your hand.'],
+    ["Thassa's Oracle", 'When this creature enters, look at the top X cards of your library, where X is your devotion to blue. Put up to one of them on top of your library and the rest on the bottom of your library in a random order. If X is greater than or equal to the number of cards in your library, you win the game. (Each {U} in the mana costs of permanents you control counts toward your devotion to blue.)'],
+    // A legend names itself, sometimes by a short name.
+    ['The One Ring', 'Indestructible\nWhen The One Ring enters, if you cast it, you gain protection from everything until your next turn.\nAt the beginning of your upkeep, you lose 1 life for each burden counter on The One Ring.\n{T}: Put a burden counter on The One Ring, then draw a card for each burden counter on The One Ring.'],
+    ['Korvold, Fae-Cursed King', 'Flying\nWhenever Korvold enters or attacks, sacrifice another permanent.\nWhenever you sacrifice a permanent, put a +1/+1 counter on Korvold and draw a card.'],
+    // Ravenous reminder text: "draw a card when it enters".
+    ['Mawloc', 'Ravenous (This creature enters with X +1/+1 counters on it. If X is 5 or more, draw a card when it enters.)\nTerror from the Deep — When this creature enters, it fights up to one target creature an opponent controls. If that creature would die this turn, exile it instead.'],
+  ])('%s is self-only', (_name, text) => {
+    expect(detectTriggerTag(text)).toMatchObject({ event: 'permanent-etb-yours', qualifier: 'self' })
+  })
+
+  it.each([
+    ['Soul Warden', 'Whenever another creature enters, you gain 1 life.'],
+    ['Impact Tremors', 'Whenever a creature you control enters, this enchantment deals 1 damage to each opponent.'],
+    ['Purphoros, God of the Forge', "Indestructible\nAs long as your devotion to red is less than five, Purphoros isn't a creature.\nWhenever another creature you control enters, Purphoros deals 2 damage to each opponent.\n{2}{R}: Creatures you control get +1/+0 until end of turn."],
+    ['Lotus Cobra', 'Landfall — Whenever a land you control enters, add one mana of any color.'],
+    ['Tome of Legends', 'This artifact enters with a page counter on it.\nWhenever your commander enters or attacks, put a page counter on this artifact.\n{1}, {T}, Remove a page counter from this artifact: Draw a card.'],
+    // Fires on itself too, but also on other Allies, so it is not narrowed.
+    ['Lantern Scout', 'Rally — Whenever this creature or another Ally you control enters, creatures you control gain lifelink until end of turn.'],
+  ])('%s watches other permanents', (_name, text) => {
+    const tag = detectTriggerTag(text)
+    expect(tag?.event).toBe('permanent-etb-yours')
+    expect(tag).not.toHaveProperty('qualifier')
+  })
+
+  it('a re-tag keeps self only on the ETB event (Eternal Witness)', () => {
+    const tag = detectTriggerTag('When this creature enters, you may return target card from your graveyard to your hand.')
+    expect(retagTrigger(tag, 'permanent-etb-yours')).toEqual({ event: 'permanent-etb-yours', qualifier: 'self' })
+    expect(retagTrigger(tag, 'creature-dies')).toEqual({ event: 'creature-dies' })
   })
 })

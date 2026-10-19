@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useBuilderStore, resolutionAlerts, discardsToHandSize, type DecisionPoint } from './builderStore'
 import type { Card, TurnCounters } from '@/types/board'
-import { detectCardMetadata } from '@/lib/triggerDetection'
+import { detectCardMetadata, retagTrigger } from '@/lib/triggerDetection'
 import { fetchTokenCard } from '@/lib/scryfallCard'
 
 // No test reaches Scryfall. By default the token lookup finds nothing, which
@@ -1904,5 +1904,244 @@ describe('turn bookkeeping: doesNotUntap, drawForTurn, pass turn at upkeep, clea
       expect(state().turnCounters.landDropsThisTurn).toEqual([0, 0, 0, 0])
       expect(state().turnCounters.spellsCastThisTurn).toEqual([1, 0, 0, 0])
     })
+  })
+})
+
+describe('re-tagging from the context menu keeps the qualifier, end to end', () => {
+  // Verbatim Scryfall oracle text.
+  const RURIC_THAR = 'Reach, vigilance\nRuric Thar attacks each combat if able.\nWhenever a player casts a noncreature spell, Ruric Thar deals 6 damage to that player.'
+  const ORCISH_BOWMASTERS = 'Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.'
+
+  const state = () => useBuilderStore.getState()
+  const promptedNames = () => state().pendingTriggerPrompt?.triggers.map(t => t.sourceCard.name)
+  const retag = (playerIndex: number, cardId: string, event: Parameters<typeof retagTrigger>[1]) => {
+    const tag = state().players![playerIndex].zones.battlefield.cards.find(c => c.id === cardId)!.triggerTag
+    state().setTriggerTag(playerIndex, cardId, retagTrigger(tag, event))
+  }
+
+  it('Ruric Thar re-tagged to "A player casts a spell" still ignores creature spells', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'ruric', name: 'Ruric Thar, the Unbowed', cardType: 'creature', ...detectCardMetadata(RURIC_THAR) })])
+    retag(1, 'ruric', 'any-player-casts')
+    withHandCards(0, [card({ id: 'bear', name: 'Grizzly Bears', cardType: 'creature' }), card({ id: 'bolt', name: 'Lightning Bolt', cardType: 'instant' })])
+
+    state().castToStack(0, 'bear', 'hand', 'cast')
+    expect(state().pendingTriggerPrompt).toBeNull()
+    state().castToStack(0, 'bolt', 'hand', 'cast')
+    expect(promptedNames()).toEqual(['Ruric Thar, the Unbowed'])
+  })
+
+  it('Orcish Bowmasters re-tagged to "A player draws a card" still skips the draw for the turn', () => {
+    withScenarioStarted()
+    withBattlefieldCards(1, [card({ id: 'bowmasters', name: 'Orcish Bowmasters', cardType: 'creature', ...detectCardMetadata(ORCISH_BOWMASTERS) })])
+    retag(1, 'bowmasters', 'any-player-draws')
+    withLibrary(0, 5)
+
+    state().drawForTurn(0)
+    expect(state().pendingTriggerPrompt).toBeNull()
+    state().drawCard(0)
+    expect(promptedNames()).toEqual(['Orcish Bowmasters'])
+  })
+})
+
+describe('permanent-etb-yours fires on every path onto the battlefield', () => {
+  const state = () => useBuilderStore.getState()
+  const battlefield = (playerIndex: number) => state().players![playerIndex].zones.battlefield.cards
+  const prompted = () => state().pendingTriggerPrompt?.triggers.map(t => `${t.sourceCard.name}@${t.controllerIndex}`)
+  const watcher = (id = 'watcher', name = 'ETB Watcher') => card({ id, name, cardType: 'enchantment', triggerTag: { event: 'permanent-etb-yours' } })
+
+  function withExile(playerIndex: 0 | 1 | 2 | 3, cards: Card[]) {
+    const players = state().players!
+    const updated = [...players] as typeof players
+    updated[playerIndex] = { ...players[playerIndex], zones: { ...players[playerIndex].zones, exile: { cards, revealed: true, cardCount: cards.length } } }
+    useBuilderStore.setState({ players: updated })
+  }
+
+  describe('moveAllCards to the battlefield', () => {
+    it('offers one prompt listing each matched trigger once, however many cards entered, including an entering card\'s own', () => {
+      withScenarioStarted()
+      withBattlefieldCards(0, [watcher()])
+      withBattlefieldCards(1, [watcher('their-watcher', 'Opponent Watcher')])
+      withExile(0, [
+        card({ id: 'mulldrifter', name: 'Mulldrifter', cardType: 'creature', triggerTag: { event: 'permanent-etb-yours' } }),
+        card({ id: 'forest', name: 'Forest', cardType: 'land' }),
+        card({ id: 'bear', name: 'Grizzly Bears', cardType: 'creature' }),
+      ])
+
+      state().moveAllCards(0, 'exile', 'battlefield')
+
+      expect(prompted()).toEqual(['ETB Watcher@0', 'Mulldrifter@0'])
+    })
+
+    it('merges into a prompt that is already pending', () => {
+      withScenarioStarted()
+      withBattlefieldCards(1, [card({ id: 'rhystic', name: 'Rhystic Study', cardType: 'enchantment', triggerTag: { event: 'opponent-casts' } })])
+      withBattlefieldCards(0, [watcher()])
+      withHandCards(0, [card({ id: 'bolt', name: 'Lightning Bolt', cardType: 'instant' })])
+      withExile(0, [card({ id: 'bear', name: 'Grizzly Bears', cardType: 'creature' })])
+
+      state().castToStack(0, 'bolt', 'hand', 'cast')
+      state().moveAllCards(0, 'exile', 'battlefield')
+
+      expect(prompted()).toEqual(['Rhystic Study@1', 'ETB Watcher@0'])
+    })
+
+    it('does not fire moving anywhere else, or before the scenario starts', () => {
+      withBattlefieldCards(0, [watcher()])
+      withExile(0, [card({ id: 'bear', name: 'Grizzly Bears', cardType: 'creature' })])
+      state().moveAllCards(0, 'exile', 'battlefield')
+      expect(state().pendingTriggerPrompt).toBeNull()
+
+      withScenarioStarted()
+      withExile(0, [card({ id: 'bear-2', name: 'Grizzly Bears', cardType: 'creature' })])
+      state().moveAllCards(0, 'exile', 'graveyard')
+      expect(state().pendingTriggerPrompt).toBeNull()
+    })
+  })
+
+  describe('addCard', () => {
+    it('fires when a card is added to the battlefield, not to another zone', () => {
+      withScenarioStarted()
+      withBattlefieldCards(0, [watcher()])
+
+      state().addCard(0, 'hand', card({ id: 'to-hand', name: 'Brainstorm', cardType: 'instant' }))
+      expect(state().pendingTriggerPrompt).toBeNull()
+
+      state().addCard(0, 'battlefield', card({ id: 'to-bf', name: 'Sol Ring', cardType: 'artifact' }))
+      expect(prompted()).toEqual(['ETB Watcher@0'])
+    })
+
+    it('fires for a token, both a new one and one stacking onto an existing token', () => {
+      withScenarioStarted()
+      withBattlefieldCards(0, [watcher()])
+      const treasure = (id: string) => card({ id, name: 'Treasure', cardType: 'artifact', isToken: true })
+
+      state().addCard(0, 'battlefield', treasure('t1'))
+      expect(prompted()).toEqual(['ETB Watcher@0'])
+      state().dismissPendingTriggers()
+
+      state().addCard(0, 'battlefield', treasure('t2'))
+      expect(battlefield(0).find(c => c.name === 'Treasure')?.stackCount).toBe(2)
+      expect(prompted()).toEqual(['ETB Watcher@0'])
+    })
+
+    it('fires for a token a resolving trigger creates, for the token\'s controller', () => {
+      const SMOTHERING_TITHE = `Whenever an opponent draws a card, that player may pay {2}. If the player doesn't, you create a Treasure token. (It's an artifact with "{T}, Sacrifice this token: Add one mana of any color.")`
+      withScenarioStarted()
+      withBattlefieldCards(1, [card({ id: 'tithe', name: 'Smothering Tithe', cardType: 'enchantment', ...detectCardMetadata(SMOTHERING_TITHE) }), watcher()])
+      withBattlefieldCards(0, [watcher('drawer-watcher', 'Drawer Watcher')])
+      withLibrary(0, 3)
+
+      state().drawCard(0)
+      state().acceptPendingTriggers()
+      state().resolveStack(state().stack.at(-1)!.id)
+
+      expect(battlefield(1).some(c => c.name === 'Treasure')).toBe(true)
+      expect(prompted()).toEqual(['ETB Watcher@1'])
+    })
+  })
+
+  describe('token copies and +1', () => {
+    it('createTokenCopy fires for a new copy, including the copy\'s own ETB, and for a copy stacking onto an earlier one', () => {
+      withScenarioStarted()
+      withBattlefieldCards(0, [card({ id: 'mulldrifter', name: 'Mulldrifter', cardType: 'creature', triggerTag: { event: 'permanent-etb-yours' } })])
+
+      state().createTokenCopy(0, 'mulldrifter')
+      expect(state().pendingTriggerPrompt?.triggers.map(t => t.sourceCard.isToken ?? false)).toEqual([false, true])
+      state().dismissPendingTriggers()
+
+      state().createTokenCopy(0, 'mulldrifter')
+      expect(battlefield(0).find(c => c.isToken)?.stackCount).toBe(2)
+      expect(state().pendingTriggerPrompt?.triggers).toHaveLength(2)
+    })
+
+    it('incrementToken fires, and nothing fires before the scenario starts', () => {
+      withBattlefieldCards(0, [watcher(), card({ id: 'treasure', name: 'Treasure', cardType: 'artifact', isToken: true })])
+      state().incrementToken(0, 'treasure')
+      state().createTokenCopy(0, 'treasure')
+      expect(state().pendingTriggerPrompt).toBeNull()
+
+      withScenarioStarted()
+      state().incrementToken(0, 'treasure')
+      expect(prompted()).toEqual(['ETB Watcher@0'])
+    })
+  })
+})
+
+describe('self-only ETB tags fire only for their own card entering, end to end from real oracle text', () => {
+  // Verbatim Scryfall oracle text.
+  const MULLDRIFTER = "Flying\nWhen this creature enters, draw two cards.\nEvoke {2}{U} (You may cast this spell for its evoke cost. If you do, it's sacrificed when it enters.)"
+  const THASSAS_ORACLE = 'When this creature enters, look at the top X cards of your library, where X is your devotion to blue. Put up to one of them on top of your library and the rest on the bottom of your library in a random order. If X is greater than or equal to the number of cards in your library, you win the game. (Each {U} in the mana costs of permanents you control counts toward your devotion to blue.)'
+  const IMPACT_TREMORS = 'Whenever a creature you control enters, this enchantment deals 1 damage to each opponent.'
+
+  const state = () => useBuilderStore.getState()
+  const battlefield = (playerIndex: number) => state().players![playerIndex].zones.battlefield.cards
+  const prompted = () => state().pendingTriggerPrompt?.triggers.map(t => t.sourceCard.id) ?? []
+  const mulldrifter = (id = 'mulldrifter') => card({ id, name: 'Mulldrifter', cardType: 'creature', ...detectCardMetadata(MULLDRIFTER) })
+  const tremors = () => card({ id: 'tremors', name: 'Impact Tremors', cardType: 'enchantment', ...detectCardMetadata(IMPACT_TREMORS) })
+  const bear = (id = 'bear') => card({ id, name: 'Grizzly Bears', cardType: 'creature' })
+
+  it('a Mulldrifter already on the battlefield is not offered when a land, a creature, or a Treasure enters; a watcher still is', () => {
+    withScenarioStarted()
+    withBattlefieldCards(0, [mulldrifter(), tremors()])
+    withHandCards(0, [card({ id: 'forest', name: 'Forest', cardType: 'land' }), bear()])
+
+    state().moveCard(0, 'forest', 'hand', 'battlefield')
+    expect(prompted()).toEqual(['tremors'])
+    state().dismissPendingTriggers()
+
+    state().moveCard(0, 'bear', 'hand', 'battlefield')
+    expect(prompted()).toEqual(['tremors'])
+    state().dismissPendingTriggers()
+
+    state().addCard(0, 'battlefield', card({ id: 'treasure', name: 'Treasure', cardType: 'artifact', isToken: true }))
+    expect(prompted()).toEqual(['tremors'])
+  })
+
+  it('is offered when it enters itself, by moving, resolving, or being added directly', () => {
+    withScenarioStarted()
+    withHandCards(0, [mulldrifter('moved'), mulldrifter('cast')])
+
+    state().moveCard(0, 'moved', 'hand', 'battlefield')
+    expect(prompted()).toEqual(['moved'])
+    state().dismissPendingTriggers()
+
+    state().castToStack(0, 'cast', 'hand', 'cast')
+    state().resolveStack(state().stack.at(-1)!.id)
+    expect(prompted()).toEqual(['cast'])
+    state().dismissPendingTriggers()
+
+    state().addCard(0, 'battlefield', card({ id: 'oracle', name: "Thassa's Oracle", cardType: 'creature', ...detectCardMetadata(THASSAS_ORACLE) }))
+    expect(prompted()).toEqual(['oracle'])
+  })
+
+  it('a bulk move offers only the self-only cards that moved, beside the watchers', () => {
+    withScenarioStarted()
+    withBattlefieldCards(0, [mulldrifter('already-here'), tremors()])
+    const players = state().players!
+    const updated = [...players] as typeof players
+    updated[0] = { ...players[0], zones: { ...players[0].zones, exile: { cards: [mulldrifter('from-exile'), bear()], revealed: true, cardCount: 2 } } }
+    useBuilderStore.setState({ players: updated })
+
+    state().moveAllCards(0, 'exile', 'battlefield')
+
+    expect(prompted()).toEqual(['tremors', 'from-exile'])
+  })
+
+  it('a token copy is offered for its own entry and the original is not, including a copy stacking onto an earlier one', () => {
+    withScenarioStarted()
+    withBattlefieldCards(0, [mulldrifter()])
+
+    state().createTokenCopy(0, 'mulldrifter')
+    const copyId = battlefield(0).find(c => c.isToken)!.id
+    expect(prompted()).toEqual([copyId])
+    state().dismissPendingTriggers()
+
+    state().createTokenCopy(0, 'mulldrifter')
+    expect(prompted()).toEqual([copyId])
+    state().dismissPendingTriggers()
+
+    state().incrementToken(0, copyId)
+    expect(prompted()).toEqual([copyId])
   })
 })
